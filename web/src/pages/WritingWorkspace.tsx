@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Isaac.X.Ω.Yuan
+﻿// SPDX-FileCopyrightText: 2026 Isaac.X.Yuan
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { useState, useEffect, useCallback, useRef } from 'react'
@@ -15,8 +15,7 @@ import { PlainTextContent } from '@/components/ui/plain-text-content'
 import { cn } from '@/lib/utils'
 import { api } from '@/services/api'
 import { useAuth } from '@/contexts/AuthContext'
-import type { Chapter } from '@/types/api'
-
+import type { Chapter, ContinueRequest } from '@/types/api'
 
 type LengthOption = {
   label: string
@@ -37,12 +36,14 @@ const MIN_TARGET_CHARS = 800
 const MAX_TARGET_CHARS = 8000
 const DEFAULT_TARGET_CHARS = 3000
 const MAX_NUM_VERSIONS = 4
+const CONTEXT_CHAPTER_SPLIT_RE = /[,\s，]+/
+const INSTRUCTION_DEBOUNCE_MS = 500
 
 const DEMO_NOVEL_TITLE = '西游记'
 const DEMO_DEFAULT_INSTRUCTION =
-  '唐僧一行在松林中遇到一位自称观音座下的年轻僧人，言辞恳切，主动请缨护送西行。' +
-  '八戒贪图省事，极力撺掇师父收留；沙僧不动声色，但注意到此人禅杖上刻有不属于佛门的纹路。' +
-  '此人身份留白——可以是真心向佛的散修，也可以是某方势力安插的棋子。' +
+  '唐僧一行在松林中遇到一位自称观音座下的年轻僧人，言辞恳切，主动请求护送西行。' +
+  '八戒贪图省事，极力劝师父收留；沙僧不动声色，但注意到此人禅杖上刻有不属于佛门的纹路。' +
+  '此人身份留白：可以是真心向佛的散修，也可以是某方势力安插的棋子。' +
   '本章以沙僧一个未说出口的疑虑收束。'
 
 function resolveTargetChars(selected: string): number {
@@ -74,6 +75,55 @@ function clampInt(raw: string, min: number, max: number): number | undefined {
   return Math.max(min, Math.min(max, n))
 }
 
+function resolveContextSelection(raw: string): {
+  contextCount?: number
+  contextNumbers?: number[]
+  error?: string
+} {
+  const trimmed = raw.trim()
+  if (!trimmed) {
+    return { contextCount: DEFAULT_CONTEXT_CHAPTERS }
+  }
+
+  const hasListSeparator = /[,\s，]/.test(trimmed)
+  if (!hasListSeparator) {
+    const contextCount = clampInt(trimmed, MIN_CONTEXT_CHAPTERS, MAX_CONTEXT_CHAPTERS)
+    if (contextCount == null) {
+      return { error: `上下文章节数需为 ${MIN_CONTEXT_CHAPTERS}-${MAX_CONTEXT_CHAPTERS}` }
+    }
+    return { contextCount }
+  }
+
+  const chunks = trimmed
+    .split(CONTEXT_CHAPTER_SPLIT_RE)
+    .map(item => item.trim())
+    .filter(Boolean)
+  if (chunks.length === 0) {
+    return { error: '请输入章节号，示例：1,3,8' }
+  }
+
+  const contextNumbers: number[] = []
+  for (const chunk of chunks) {
+    if (!/^\d+$/.test(chunk)) {
+      return { error: '章节号只能是正整数，使用逗号分隔' }
+    }
+    const num = Number(chunk)
+    if (num < 1) {
+      return { error: '章节号必须大于等于 1' }
+    }
+    if (!contextNumbers.includes(num)) {
+      contextNumbers.push(num)
+    }
+  }
+
+  if (contextNumbers.length > MAX_CONTEXT_CHAPTERS) {
+    return { error: `最多选择 ${MAX_CONTEXT_CHAPTERS} 个上下文章节` }
+  }
+
+  contextNumbers.sort((a, b) => a - b)
+  return { contextNumbers }
+}
+
 export function WritingWorkspace() {
   const { novelId, chapterNum } = useParams<{ novelId: string; chapterNum: string }>()
   const navigate = useNavigate()
@@ -84,22 +134,26 @@ export function WritingWorkspace() {
   const [chapter, setChapter] = useState<Chapter | null>(null)
   const [novelTitle, setNovelTitle] = useState('')
   const [instruction, setInstruction] = useState('')
+  const [instructionHydrated, setInstructionHydrated] = useState(false)
+  const [instructionSaveState, setInstructionSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const [lengthMode, setLengthMode] = useState<'preset' | 'custom'>('preset')
   const [selectedLength, setSelectedLength] = useState('3000')
   const [customTargetChars, setCustomTargetChars] = useState(String(DEFAULT_TARGET_CHARS))
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [contextChapters, setContextChapters] = useState(String(DEFAULT_CONTEXT_CHAPTERS))
+  const [contextInputError, setContextInputError] = useState<string | null>(null)
   const [numVersions, setNumVersions] = useState('1')
   const [temperature, setTemperature] = useState('0.8')
   const [strictMode, setStrictMode] = useState(false)
   const [prefsLoaded, setPrefsLoaded] = useState(false)
 
-  // Load user preferences as defaults (once)
+  const lastPersistedInstructionRef = useRef('')
+  const instructionSaveSeqRef = useRef(0)
+
+  // Load user preferences as defaults (once).
   useEffect(() => {
     if (prefsLoaded || !user?.preferences) return
     const p = user.preferences as Record<string, unknown>
-    // Prefer updating state in a callback (not synchronously in the effect body)
-    // to avoid cascading renders.
     queueMicrotask(() => {
       if (p.num_versions != null) setNumVersions(String(p.num_versions))
       if (p.temperature != null) setTemperature(String(p.temperature))
@@ -125,53 +179,122 @@ export function WritingWorkspace() {
     })
   }, [user?.preferences, prefsLoaded])
 
-  // Save preferences to server when advanced settings change
+  // Save preferences to server when advanced settings change.
   const savePrefs = useCallback(() => {
     const prefs: Record<string, unknown> = {}
     const nv = parseInt(numVersions, 10)
     if (!Number.isNaN(nv)) prefs.num_versions = Math.max(1, Math.min(MAX_NUM_VERSIONS, nv))
     const temp = parseFloat(temperature)
     if (!Number.isNaN(temp)) prefs.temperature = Math.max(0, Math.min(2, temp))
-    prefs.context_chapters = clampInt(contextChapters, MIN_CONTEXT_CHAPTERS, MAX_CONTEXT_CHAPTERS) ?? DEFAULT_CONTEXT_CHAPTERS
+    const contextSelection = resolveContextSelection(contextChapters)
+    if (contextSelection.contextCount != null) {
+      prefs.context_chapters = contextSelection.contextCount
+    }
     prefs.length_mode = lengthMode
     prefs.strict_mode = strictMode
-    const tc = resolveTargetCharsForMode(lengthMode, selectedLength, customTargetChars)
-    prefs.target_chars = tc
+    prefs.target_chars = resolveTargetCharsForMode(lengthMode, selectedLength, customTargetChars)
     api.updatePreferences(prefs).catch(() => {})
   }, [numVersions, temperature, contextChapters, lengthMode, selectedLength, customTargetChars, strictMode])
 
   useEffect(() => {
     if (!nId || !cNum) return
     let cancelled = false
-    api.getNovel(nId).then(n => {
-      if (cancelled) return
-      setNovelTitle(n.title)
-      if (!demoDefaultApplied.current && n.title === DEMO_NOVEL_TITLE) {
-        demoDefaultApplied.current = true
-        setInstruction(prev => prev || DEMO_DEFAULT_INSTRUCTION)
-      }
-    }).catch(() => {})
-    api.getChapter(nId, cNum)
-      .then(data => { if (!cancelled) setChapter(data) })
-      .catch(err => console.error('Failed to load chapter', err))
-    return () => { cancelled = true }
+    setInstructionHydrated(false)
+    setInstructionSaveState('idle')
+
+    Promise.all([api.getNovel(nId), api.getChapter(nId, cNum)])
+      .then(([novel, ch]) => {
+        if (cancelled) return
+
+        setNovelTitle(novel.title)
+        setChapter(ch)
+
+        const dbPrompt = String(ch.continuation_prompt ?? '')
+        const fallback = novel.title === DEMO_NOVEL_TITLE ? DEMO_DEFAULT_INSTRUCTION : ''
+        const initialInstruction = dbPrompt || fallback
+
+        setInstruction(initialInstruction)
+        lastPersistedInstructionRef.current = dbPrompt
+        setInstructionHydrated(true)
+      })
+      .catch(err => {
+        if (cancelled) return
+        console.error('Failed to load writing workspace', err)
+      })
+
+    return () => {
+      cancelled = true
+    }
   }, [nId, cNum])
 
-  // Pre-fill instruction for demo novel (once, after title loads)
-  const demoDefaultApplied = useRef(false)
+  // Autosave continuation instruction to DB (per chapter) with debounce.
+  useEffect(() => {
+    if (!instructionHydrated || !nId || !cNum) return
+    if (instruction === lastPersistedInstructionRef.current) return
+
+    instructionSaveSeqRef.current += 1
+    const seq = instructionSaveSeqRef.current
+    const draft = instruction
+
+    const timer = window.setTimeout(async () => {
+      setInstructionSaveState('saving')
+      try {
+        const updated = await api.updateChapter(nId, cNum, { continuation_prompt: draft })
+        if (instructionSaveSeqRef.current !== seq) return
+
+        const savedPrompt = String(updated.continuation_prompt ?? draft)
+        lastPersistedInstructionRef.current = savedPrompt
+        setChapter(updated)
+        setInstructionSaveState('saved')
+      } catch (err) {
+        if (instructionSaveSeqRef.current !== seq) return
+        console.error('Failed to save continuation instruction', err)
+        setInstructionSaveState('error')
+      }
+    }, INSTRUCTION_DEBOUNCE_MS)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [instruction, instructionHydrated, nId, cNum])
+
+  const handleInstructionChange = useCallback((next: string) => {
+    setInstruction(next)
+    if (instructionSaveState === 'error' || instructionSaveState === 'saved') {
+      setInstructionSaveState('idle')
+    }
+  }, [instructionSaveState])
+
+  const handleContextChaptersChange = useCallback((next: string) => {
+    setContextChapters(next)
+    setContextInputError(null)
+  }, [])
 
   const handleGenerate = () => {
     const parsedTemp = parseFloat(temperature)
     const resolvedTargetChars = resolveTargetCharsForMode(lengthMode, selectedLength, customTargetChars)
-    const streamParams = {
+    const contextSelection = resolveContextSelection(contextChapters)
+    if (contextSelection.error) {
+      setContextInputError(contextSelection.error)
+      return
+    }
+    setContextInputError(null)
+
+    const streamParams: ContinueRequest = {
       prompt: instruction.trim() || undefined,
       length_mode: lengthMode,
       target_chars: resolvedTargetChars,
-      context_chapters: clampInt(contextChapters, MIN_CONTEXT_CHAPTERS, MAX_CONTEXT_CHAPTERS) ?? DEFAULT_CONTEXT_CHAPTERS,
       num_versions: clampInt(numVersions, 1, MAX_NUM_VERSIONS) || undefined,
       temperature: !Number.isNaN(parsedTemp) ? Math.max(0, Math.min(2, parsedTemp)) : undefined,
       strict_mode: strictMode,
     }
+
+    if (contextSelection.contextNumbers && contextSelection.contextNumbers.length > 0) {
+      streamParams.context_chapter_numbers = contextSelection.contextNumbers
+    } else {
+      streamParams.context_chapters = contextSelection.contextCount ?? DEFAULT_CONTEXT_CHAPTERS
+    }
+
     savePrefs()
     navigate(`/novel/${novelId}/chapter/${chapterNum}/results`, {
       state: { streamParams, novelId: nId },
@@ -180,6 +303,15 @@ export function WritingWorkspace() {
 
   const loadingChapter = !chapter || chapter.novel_id !== nId || chapter.chapter_number !== cNum
   const wordCount = !loadingChapter ? (chapter?.content?.length ?? 0) : 0
+
+  const instructionSaveHint =
+    instructionSaveState === 'saving'
+      ? '续写指令保存中...'
+      : instructionSaveState === 'saved'
+        ? '续写指令已保存'
+        : instructionSaveState === 'error'
+          ? '续写指令保存失败，将自动重试'
+          : '续写指令按章节独立保存'
 
   return (
     <PageShell
@@ -204,7 +336,6 @@ export function WritingWorkspace() {
       mainClassName="overflow-hidden"
     >
       <div className="flex flex-1 overflow-hidden">
-        {/* Preview Area */}
         <div className="flex-1 min-w-0 flex flex-col gap-6 px-8 py-8 lg:px-12 overflow-hidden">
           <div className="flex items-center justify-between">
             <GlassCard variant="control" className="rounded-xl px-4 py-2">
@@ -227,26 +358,26 @@ export function WritingWorkspace() {
           </GlassCard>
         </div>
 
-        {/* Parameter Panel */}
         <aside className="w-[480px] shrink-0 border-l border-[var(--nw-glass-border)] bg-[var(--nw-glass-bg)] backdrop-blur-2xl p-6 flex flex-col gap-6 overflow-auto nw-scrollbar-thin">
           <h2 className="font-mono text-base font-semibold text-foreground">
             续写设置
           </h2>
 
-          {/* Instruction */}
           <div className="space-y-2">
             <label className="text-sm font-medium text-foreground">
               续写指令（可选）
             </label>
             <Textarea
               value={instruction}
-              onChange={e => setInstruction(e.target.value)}
+              onChange={e => handleInstructionChange(e.target.value)}
               placeholder="描述你想要的情节走向，或留空让 AI 自由续写"
               className="min-h-[80px] resize-none text-[13px] leading-relaxed bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-accent focus-visible:ring-offset-0"
             />
+            <p className={cn('text-xs', instructionSaveState === 'error' ? 'text-red-500' : 'text-muted-foreground')}>
+              {instructionSaveHint}
+            </p>
           </div>
 
-          {/* Length */}
           <div className="space-y-2">
             <label className="text-sm font-medium text-foreground">
               续写长度
@@ -289,7 +420,7 @@ export function WritingWorkspace() {
                   className="h-9 font-mono bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-accent focus-visible:ring-offset-0"
                 />
                 <p className="text-xs text-muted-foreground">
-                  {MIN_TARGET_CHARS}–{MAX_TARGET_CHARS} 字
+                  {MIN_TARGET_CHARS}-{MAX_TARGET_CHARS} 字
                 </p>
               </div>
             ) : null}
@@ -309,8 +440,8 @@ export function WritingWorkspace() {
                         isDisabled
                           ? 'bg-muted/50 border-muted text-muted-foreground/40 cursor-not-allowed'
                           : isSelected
-                          ? 'bg-[hsl(var(--accent)/0.12)] border-accent text-accent font-semibold'
-                          : 'bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-muted-foreground hover:bg-[var(--nw-glass-bg-hover)]'
+                            ? 'bg-[hsl(var(--accent)/0.12)] border-accent text-accent font-semibold'
+                            : 'bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-muted-foreground hover:bg-[var(--nw-glass-bg-hover)]'
                       )}
                     >
                       {opt.label}
@@ -321,7 +452,6 @@ export function WritingWorkspace() {
             ) : null}
           </div>
 
-          {/* Advanced Toggle */}
           <button
             type="button"
             onClick={() => setAdvancedOpen(v => !v)}
@@ -335,7 +465,6 @@ export function WritingWorkspace() {
             )}
           </button>
 
-          {/* Advanced Panel */}
           <div
             className={cn(
               'grid transition-[grid-template-rows] duration-200',
@@ -344,9 +473,18 @@ export function WritingWorkspace() {
           >
             <div className="overflow-hidden">
               <GlassCard className="rounded-xl p-4 flex flex-col gap-4">
-                <AdvancedRow label="上下文章节数" desc="1–5" value={contextChapters} onChange={setContextChapters} type="number" min={MIN_CONTEXT_CHAPTERS} max={MAX_CONTEXT_CHAPTERS} step={1} />
-                <AdvancedRow label="生成版本数" desc="1–4" value={numVersions} onChange={setNumVersions} type="number" min={1} max={MAX_NUM_VERSIONS} step={1} />
-                <AdvancedRow label="创意温度" desc="0.0–2.0" value={temperature} onChange={setTemperature} type="number" min={0} max={2} step={0.1} />
+                <AdvancedRow
+                  label="上下文章节"
+                  desc={`可填 ${MIN_CONTEXT_CHAPTERS}-${MAX_CONTEXT_CHAPTERS}，或 1,3,8（最多 ${MAX_CONTEXT_CHAPTERS} 章）`}
+                  value={contextChapters}
+                  onChange={handleContextChaptersChange}
+                  type="text"
+                />
+                {contextInputError ? (
+                  <p className="text-xs text-red-500">{contextInputError}</p>
+                ) : null}
+                <AdvancedRow label="生成版本数" desc="1-4" value={numVersions} onChange={setNumVersions} type="number" min={1} max={MAX_NUM_VERSIONS} step={1} />
+                <AdvancedRow label="创意温度" desc="0.0-2.0" value={temperature} onChange={setTemperature} type="number" min={0} max={2} step={0.1} />
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex flex-col gap-0.5 min-w-0">
                     <span className="text-sm font-medium text-foreground">
@@ -368,7 +506,6 @@ export function WritingWorkspace() {
 
           <div className="flex-1" />
 
-          {/* Generate Button */}
           <NwButton
             data-testid="workspace-generate-button"
             onClick={handleGenerate}

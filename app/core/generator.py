@@ -204,6 +204,7 @@ async def _build_continuation_prompt(
     max_tokens: int | None = None,
     target_chars: int | None = None,
     context_chapters: int | None = None,
+    recent_chapters_text: str | None = None,
     world_context: str | None = None,
     narrative_constraints: str | None = None,
     world_debug_summary: dict | None = None,
@@ -238,22 +239,29 @@ async def _build_continuation_prompt(
             f"Novel {novel_id} not found. Please upload a novel first using POST /api/novels/upload."
         )
 
-    effective_context_chapters = resolve_context_chapters(
-        context_chapters,
-        default=settings.max_context_chapters,
-    )
-    recent_chapters = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id)
-        .order_by(Chapter.chapter_number.desc())
-        .limit(effective_context_chapters)
-        .all()
-    )
-    recent_chapters = list(reversed(recent_chapters))
+    recent_content = str(recent_chapters_text or "").strip()
+    if not recent_content:
+        effective_context_chapters = resolve_context_chapters(
+            context_chapters,
+            default=settings.max_context_chapters,
+        )
+        recent_chapters = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel_id)
+            .order_by(Chapter.chapter_number.desc())
+            .limit(effective_context_chapters)
+            .all()
+        )
+        recent_chapters = list(reversed(recent_chapters))
 
-    if not recent_chapters:
-        raise ValueError(
-            f"Novel {novel_id} has no chapters. Cannot generate continuation without existing content."
+        if not recent_chapters:
+            raise ValueError(
+                f"Novel {novel_id} has no chapters. Cannot generate continuation without existing content."
+            )
+
+        recent_content = "\n\n".join(
+            f"【Chapter {ch.chapter_number}: {ch.title}】\n{ch.content}"
+            for ch in recent_chapters
         )
 
     outlines = (
@@ -262,11 +270,6 @@ async def _build_continuation_prompt(
         .order_by(Outline.chapter_end.desc())
         .limit(2)
         .all()
-    )
-
-    recent_content = "\n\n".join(
-        f"【第{ch.chapter_number}章：{ch.title}】\n{ch.content}"
-        for ch in recent_chapters
     )
 
     outline_content = "\n\n".join(
@@ -415,6 +418,7 @@ async def continue_novel(
     max_tokens: int | None = None,
     target_chars: int | None = None,
     context_chapters: int | None = None,
+    recent_chapters_text: str | None = None,
     world_context: str | None = None,
     narrative_constraints: str | None = None,
     world_debug_summary: dict | None = None,
@@ -452,6 +456,7 @@ async def continue_novel(
         max_tokens=max_tokens,
         target_chars=target_chars,
         context_chapters=context_chapters,
+        recent_chapters_text=recent_chapters_text,
         world_context=world_context,
         narrative_constraints=narrative_constraints,
         world_debug_summary=world_debug_summary,
@@ -519,6 +524,7 @@ async def continue_novel_stream(
     max_tokens: int | None = None,
     target_chars: int | None = None,
     context_chapters: int | None = None,
+    recent_chapters_text: str | None = None,
     world_context: str | None = None,
     narrative_constraints: str | None = None,
     world_debug_summary: dict | None = None,
@@ -538,6 +544,7 @@ async def continue_novel_stream(
         max_tokens=max_tokens,
         target_chars=target_chars,
         context_chapters=context_chapters,
+        recent_chapters_text=recent_chapters_text,
         world_context=world_context,
         narrative_constraints=narrative_constraints,
         world_debug_summary=world_debug_summary,

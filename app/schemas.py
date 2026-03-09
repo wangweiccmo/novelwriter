@@ -1,3 +1,5 @@
+import re
+
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator, TypeAdapter
 from pydantic_core import PydanticCustomError
 from typing import ClassVar, Optional, List, Literal, Any
@@ -41,6 +43,7 @@ class ChapterResponse(BaseModel):
     chapter_number: int
     title: str
     content: str
+    continuation_prompt: str = ""
     created_at: datetime
     updated_at: datetime | None = None
 
@@ -60,12 +63,14 @@ class ChapterMetaResponse(BaseModel):
 class ChapterUpdateRequest(BaseModel):
     title: str | None = None
     content: str | None = None
+    continuation_prompt: str | None = Field(default=None, max_length=2000)
 
 
 class ChapterCreateRequest(BaseModel):
     chapter_number: int | None = None  # default: smallest missing positive chapter number
     title: str = ""
     content: str = ""
+    continuation_prompt: str = Field(default="", max_length=2000)
 
 
 class OutlineResponse(BaseModel):
@@ -92,6 +97,7 @@ class ContinuationResponse(BaseModel):
 
 class ContinueRequest(BaseModel):
     ALLOWED_TARGET_CHARS: ClassVar[set[int]] = {2000, 3000, 4000}
+    _CONTEXT_CHAPTER_SPLIT_RE: ClassVar[re.Pattern[str]] = re.compile(r"[,\s，]+")
 
     num_versions: int = Field(default=1, ge=1, le=MAX_CONTINUATION_VERSIONS)
     length_mode: Literal["preset", "custom"] | None = Field(
@@ -110,6 +116,13 @@ class ContinueRequest(BaseModel):
         default=None,
         ge=1,
         description=f"用于续写上下文的最近章节数（仅允许 1-{MAX_CONTEXT_CHAPTERS}，超过时按 {MAX_CONTEXT_CHAPTERS} 处理）",
+    )
+    context_chapter_numbers: List[int] | None = Field(
+        default=None,
+        description=(
+            f"指定用于续写上下文的章节号列表，支持数组或逗号分隔字符串（最多 {MAX_CONTEXT_CHAPTERS} 个），"
+            "可用于非连续章节。提供时优先于 context_chapters。"
+        ),
     )
     temperature: float | None = Field(
         default=None,
@@ -148,7 +161,45 @@ class ContinueRequest(BaseModel):
 
         if self.context_chapters is not None and self.context_chapters > MAX_CONTEXT_CHAPTERS:
             self.context_chapters = MAX_CONTEXT_CHAPTERS
+
+        if self.context_chapter_numbers:
+            normalized: list[int] = []
+            seen: set[int] = set()
+            for raw_num in self.context_chapter_numbers:
+                num = int(raw_num)
+                if num < 1:
+                    raise ValueError("context_chapter_numbers must contain positive integers")
+                if num in seen:
+                    continue
+                seen.add(num)
+                normalized.append(num)
+            if len(normalized) > MAX_CONTEXT_CHAPTERS:
+                raise ValueError(f"context_chapter_numbers must contain at most {MAX_CONTEXT_CHAPTERS} chapters")
+            self.context_chapter_numbers = normalized
         return self
+
+    @field_validator("context_chapter_numbers", mode="before")
+    @classmethod
+    def _parse_context_chapter_numbers(cls, value: Any):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            chunks = [chunk for chunk in cls._CONTEXT_CHAPTER_SPLIT_RE.split(raw) if chunk]
+            if not chunks:
+                return None
+            parsed: list[int] = []
+            for chunk in chunks:
+                try:
+                    parsed.append(int(chunk))
+                except ValueError as exc:
+                    raise ValueError("context_chapter_numbers must contain integers") from exc
+            return parsed
+        if isinstance(value, list):
+            return value
+        raise ValueError("context_chapter_numbers must be a list or comma-separated string")
 
 
 class RatingRequest(BaseModel):

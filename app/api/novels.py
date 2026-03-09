@@ -117,6 +117,35 @@ def _safe_delete_where(
         raise
 
 
+def _latest_chapter_rows_query(db: Session, *, novel_id: int):
+    """Return one row per chapter_number, preferring the latest row (max id).
+
+    This is a defensive read path for legacy DBs that may still contain duplicate
+    (novel_id, chapter_number) rows.
+    """
+    latest_ids_subq = (
+        db.query(sa.func.max(Chapter.id).label("id"))
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
+    return db.query(Chapter).join(latest_ids_subq, Chapter.id == latest_ids_subq.c.id)
+
+
+def _recompute_total_chapters(db: Session, *, novel_id: int) -> int:
+    """Recompute logical chapter count by unique chapter_number."""
+    total = (
+        db.query(sa.func.count(sa.distinct(Chapter.chapter_number)))
+        .filter(Chapter.novel_id == novel_id)
+        .scalar()
+    )
+    resolved_total = int(total or 0)
+    db.query(Novel).filter(Novel.id == novel_id).update(
+        {Novel.total_chapters: resolved_total}
+    )
+    return resolved_total
+
+
 def get_llm_config(request: Request) -> dict | None:
     """Extract per-request LLM config from headers.
 
@@ -486,6 +515,8 @@ class _ContinuationContext:
     debug_summary: ContinueDebugSummary
     writer_ctx: dict[str, Any]
     effective_context_chapters: int
+    context_chapter_numbers: list[int] | None = None
+    effective_prompt: str | None = None
 
 
 def _resolve_use_lorebook(req: ContinueRequest) -> bool:
@@ -641,10 +672,11 @@ async def _generate_continuations_with_postcheck(
             db=db,
             novel_id=novel_id,
             num_versions=req.num_versions,
-            prompt=prompt_override if prompt_override is not None else req.prompt,
+            prompt=prompt_override if prompt_override is not None else ctx.effective_prompt,
             max_tokens=req.max_tokens,
             target_chars=req.target_chars,
             context_chapters=ctx.effective_context_chapters,
+            recent_chapters_text=ctx.recent_text,
             world_context=ctx.world_context,
             narrative_constraints=ctx.narrative_constraints,
             world_debug_summary=debug_payload,
@@ -661,7 +693,7 @@ async def _generate_continuations_with_postcheck(
         writer_ctx=ctx.writer_ctx,
         recent_text=ctx.recent_text,
         # Keep postcheck baseline stable even on strict repair retry.
-        user_prompt=req.prompt,
+        user_prompt=ctx.effective_prompt,
         continuations=continuations,
     )
 
@@ -682,12 +714,12 @@ async def _generate_continuations_with_postcheck(
                     attempt=2,
                 ),
             )
-            repaired_prompt = _build_strict_repair_prompt(req.prompt, strict_warnings)
+            repaired_prompt = _build_strict_repair_prompt(ctx.effective_prompt, strict_warnings)
             continuations = await _generate_once(repaired_prompt, attempt=2)
             postcheck_warnings = postcheck_continuation(
                 writer_ctx=ctx.writer_ctx,
                 recent_text=ctx.recent_text,
-                user_prompt=req.prompt,
+                user_prompt=ctx.effective_prompt,
                 continuations=continuations,
             )
             strict_warnings = _strict_postcheck_warnings(postcheck_warnings)
@@ -727,19 +759,36 @@ def _prepare_continuation_context(
     novel = db.query(Novel).filter(Novel.id == novel_id).first()
     _verify_novel_access(novel, current_user)
 
-    effective_context_chapters = resolve_context_chapters(
-        req.context_chapters,
-        default=settings.max_context_chapters,
-    )
+    requested_chapters = list(req.context_chapter_numbers or [])
+    if requested_chapters:
+        requested_chapters = sorted(set(int(num) for num in requested_chapters))
+        chapters = (
+            _latest_chapter_rows_query(db, novel_id=novel_id)
+            .filter(Chapter.chapter_number.in_(requested_chapters))
+            .all()
+        )
+        chapter_map = {int(ch.chapter_number): ch for ch in chapters}
+        missing = [num for num in requested_chapters if num not in chapter_map]
+        if missing:
+            missing_str = ", ".join(str(num) for num in missing)
+            raise HTTPException(status_code=400, detail=f"Context chapters not found: {missing_str}")
+        recent_chapters = [chapter_map[num] for num in requested_chapters]
+        effective_context_chapters = len(recent_chapters)
+    else:
+        effective_context_chapters = resolve_context_chapters(
+            req.context_chapters,
+            default=settings.max_context_chapters,
+        )
 
-    recent_chapters = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id)
-        .order_by(Chapter.chapter_number.desc())
-        .limit(effective_context_chapters)
-        .all()
-    )
-    recent_chapters = list(reversed(recent_chapters))
+        recent_chapters = (
+            _latest_chapter_rows_query(db, novel_id=novel_id)
+            .order_by(Chapter.chapter_number.desc())
+            .limit(effective_context_chapters)
+            .all()
+        )
+        recent_chapters = list(reversed(recent_chapters))
+        requested_chapters = [int(ch.chapter_number) for ch in recent_chapters]
+
     if not recent_chapters:
         raise HTTPException(status_code=400, detail="Novel has no chapters")
 
@@ -748,9 +797,15 @@ def _prepare_continuation_context(
         for ch in recent_chapters
     )
 
+    effective_prompt = (req.prompt or "").strip() or None
+    if not effective_prompt and recent_chapters:
+        fallback_prompt = str(getattr(recent_chapters[-1], "continuation_prompt", "") or "").strip()
+        if fallback_prompt:
+            effective_prompt = fallback_prompt
+
     relevance_text = recent_text
-    if req.prompt and req.prompt.strip():
-        relevance_text = relevance_text + "\n\n【用户续写指令】\n" + req.prompt.strip()
+    if effective_prompt:
+        relevance_text = relevance_text + "\n\n【用户续写指令】\n" + effective_prompt
 
     try:
         writer_ctx = assemble_writer_context(db, novel_id, chapter_text=relevance_text)
@@ -770,6 +825,8 @@ def _prepare_continuation_context(
         debug_summary=debug_summary,
         writer_ctx=writer_ctx,
         effective_context_chapters=effective_context_chapters,
+        context_chapter_numbers=requested_chapters,
+        effective_prompt=effective_prompt,
     )
 
 
@@ -915,8 +972,7 @@ def get_chapters(
     _verify_novel_access(novel, current_user)
 
     query = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id)
+        _latest_chapter_rows_query(db, novel_id=novel_id)
         .order_by(Chapter.chapter_number)
         .offset(skip)
     )
@@ -938,29 +994,22 @@ def get_chapters_meta(
     _verify_novel_access(novel, current_user)
 
     query = (
-        db.query(
-            Chapter.id,
-            Chapter.novel_id,
-            Chapter.chapter_number,
-            Chapter.title,
-            Chapter.created_at,
-        )
-        .filter(Chapter.novel_id == novel_id)
+        _latest_chapter_rows_query(db, novel_id=novel_id)
         .order_by(Chapter.chapter_number)
         .offset(skip)
     )
     if limit is not None:
         query = query.limit(limit)
-    rows = query.all()
+    chapters = query.all()
     return [
         ChapterMetaResponse(
-            id=r.id,
-            novel_id=r.novel_id,
-            chapter_number=r.chapter_number,
-            title=r.title,
-            created_at=r.created_at,
+            id=chapter.id,
+            novel_id=chapter.novel_id,
+            chapter_number=chapter.chapter_number,
+            title=chapter.title,
+            created_at=chapter.created_at,
         )
-        for r in rows
+        for chapter in chapters
     ]
 
 
@@ -976,8 +1025,8 @@ def get_chapter(
     _verify_novel_access(novel, current_user)
 
     chapter = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
+        _latest_chapter_rows_query(db, novel_id=novel_id)
+        .filter(Chapter.chapter_number == chapter_number)
         .first()
     )
     if not chapter:
@@ -1012,13 +1061,12 @@ def create_chapter(
                 chapter_number=chapter_number,
                 title=req.title,
                 content=req.content,
+                continuation_prompt=req.continuation_prompt,
             )
             db.add(chapter)
             try:
                 db.flush()  # surface unique constraint failures before commit
-                db.query(Novel).filter(Novel.id == novel_id).update(
-                    {Novel.total_chapters: Novel.total_chapters + 1}
-                )
+                _recompute_total_chapters(db, novel_id=novel_id)
                 db.commit()
             except IntegrityError:
                 db.rollback()
@@ -1055,13 +1103,12 @@ def create_chapter(
         chapter_number=chapter_number,
         title=req.title,
         content=req.content,
+        continuation_prompt=req.continuation_prompt,
     )
     db.add(chapter)
     try:
         db.flush()
-        db.query(Novel).filter(Novel.id == novel_id).update(
-            {Novel.total_chapters: Novel.total_chapters + 1}
-        )
+        _recompute_total_chapters(db, novel_id=novel_id)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -1083,28 +1130,44 @@ def update_chapter(
     novel = db.query(Novel).filter(Novel.id == novel_id).first()
     _verify_novel_access(novel, current_user)
 
-    chapter = (
+    chapters = (
         db.query(Chapter)
         .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
-        .first()
+        .order_by(Chapter.id.desc())
+        .all()
     )
-    if not chapter:
+    if not chapters:
         raise HTTPException(
             status_code=404,
             detail=f"Chapter {chapter_number} not found in novel {novel_id}",
         )
 
-    if req.title is None and req.content is None:
-        raise HTTPException(status_code=400, detail="Must provide title and/or content")
+    if req.title is None and req.content is None and req.continuation_prompt is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Must provide title and/or content and/or continuation_prompt",
+        )
 
-    if req.title is not None:
-        chapter.title = req.title
-    if req.content is not None:
-        chapter.content = req.content
+    for chapter in chapters:
+        if req.title is not None:
+            chapter.title = req.title
+        if req.content is not None:
+            chapter.content = req.content
+        if req.continuation_prompt is not None:
+            chapter.continuation_prompt = req.continuation_prompt
+
     db.commit()
-    db.refresh(chapter)
+    latest_chapter = chapters[0]
+    db.refresh(latest_chapter)
+    if len(chapters) > 1:
+        logger.warning(
+            "Updated duplicate chapter rows for novel=%s chapter_number=%s count=%s",
+            novel_id,
+            chapter_number,
+            len(chapters),
+        )
     record_event(db, current_user.id, "chapter_save", novel_id=novel_id, meta={"chapter": chapter_number})
-    return chapter
+    return latest_chapter
 
 
 @router.delete("/{novel_id}/chapters/{chapter_number}", status_code=204)
@@ -1118,22 +1181,30 @@ def delete_chapter(
     novel = db.query(Novel).filter(Novel.id == novel_id).first()
     _verify_novel_access(novel, current_user)
 
-    chapter = (
+    chapters = (
         db.query(Chapter)
         .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
-        .first()
+        .order_by(Chapter.id.desc())
+        .all()
     )
-    if not chapter:
+    if not chapters:
         raise HTTPException(
             status_code=404,
             detail=f"Chapter {chapter_number} not found in novel {novel_id}",
         )
 
-    db.delete(chapter)
-    db.query(Novel).filter(Novel.id == novel_id).update(
-        {Novel.total_chapters: Novel.total_chapters - 1}
-    )
+    for chapter in chapters:
+        db.delete(chapter)
+    db.flush()
+    _recompute_total_chapters(db, novel_id=novel_id)
     db.commit()
+    if len(chapters) > 1:
+        logger.warning(
+            "Deleted duplicate chapter rows for novel=%s chapter_number=%s count=%s",
+            novel_id,
+            chapter_number,
+            len(chapters),
+        )
     return Response(status_code=204)
 
 
@@ -1454,10 +1525,11 @@ async def continue_novel_stream_endpoint(
                 db=db,
                 novel_id=novel_id,
                 num_versions=req.num_versions,
-                prompt=req.prompt,
+                prompt=ctx.effective_prompt,
                 max_tokens=req.max_tokens,
                 target_chars=req.target_chars,
                 context_chapters=ctx.effective_context_chapters,
+                recent_chapters_text=ctx.recent_text,
                 world_context=ctx.world_context,
                 narrative_constraints=ctx.narrative_constraints,
                 world_debug_summary=debug_payload,
@@ -1493,7 +1565,7 @@ async def continue_novel_stream_endpoint(
                         postcheck_warnings = postcheck_continuation(
                             writer_ctx=ctx.writer_ctx,
                             recent_text=ctx.recent_text,
-                            user_prompt=req.prompt,
+                            user_prompt=ctx.effective_prompt,
                             continuations=conts,
                         )
                         lore_debug_update = _extract_lore_debug_fields(debug_payload)

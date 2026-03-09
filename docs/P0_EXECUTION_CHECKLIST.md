@@ -132,3 +132,56 @@
 2. 关键链路有结构化日志与事件指标。  
 3. 文档 `CONTINUATION_RULES` 与 `ARCHITECTURE` 已同步更新。  
 4. 至少完成一次灰度与回滚演练记录。  
+
+## 6. 竞品对比归档（2026-03-09）
+
+对比对象（同类小说/网文生成工具）：`ChatGPT`、`Claude`、`Sudowrite`、`NovelAI`、`Novelcrafter`。  
+本次归档目标：明确本工程在“长篇网文生产”场景下的功能竞争位势，用于后续版本取舍。
+
+### 6.1 总体定位结论
+
+本工程更接近“可自部署、可治理、强调一致性的专业续写内核”，而非“协作优先的通用 SaaS 写作平台”。
+
+### 6.2 功能优势（相对竞品）
+
+1. 一致性治理能力强：世界模型（实体/关系/体系）+ 叙事约束 + strict postcheck 重试/阻断，能显式抑制设定漂移。  
+2. 续写可控参数完整：支持长度模式、目标字数、版本数、多版本流式产出、Lorebook 开关与注入调试摘要。  
+3. 工程化与可运维性好：瞬时错误重试、`max_tokens` 上限回退、事件入库、结构化日志、灰度/回滚策略明确。  
+4. 成本与计费语义清晰：hosted 路径采用“预留 -> 按成功版本计费 -> 未用返还”，用户只为成功产出付费。  
+5. 私有化友好：`BYOK` + selfhost 模式可直接落地，对数据主权和模型可替换性更友好。
+
+### 6.3 功能劣势（相对竞品）
+
+1. 协作产品能力偏弱：缺少成熟的多人协同、角色权限、团队知识空间与共享工作流。  
+2. 世界观生态闭环未完全显式：当前主链路以 `worldpack import` 为主，开放导出能力与生态分发能力仍需增强。  
+3. 规模化架构上限已知：LLM 并发闸门为进程内实现，bootstrap 与应用进程同生命周期，横向扩展成本较高。  
+4. 平台生态厚度不足：相较头部 SaaS，在插件/连接器、模板市场、创作者社区沉淀方面仍有差距。
+
+### 6.4 后续优先改进建议（面向竞争力）
+
+1. P1：补齐世界观双向流通（标准化导出 + 包版本管理 + 冲突策略可视化）。  
+2. P1：引入协作基础能力（项目共享、只读/编辑权限、操作审计）。  
+3. P2：将并发闸门与后台任务外部化（队列/worker），提升 hosted 场景稳定性上限。  
+
+推断（基于以上事实）：如果你的目标用户是重视私有部署、可审计、可控续写的网文作者/团队，本工程竞争力很高；如果目标是大众 SaaS 协作写作市场，短板会主要体现在协作与产品化层。
+
+外部对比来源（官方）
+
+Sudowrite pricing: https://www.sudowrite.com/pricing
+Sudowrite docs: https://docs.sudowrite.com
+NovelAI docs (Editor/Lorebook): https://docs.novelai.net/en/text/editor/ , https://docs.novelai.net/en/text/lorebook/
+NovelAI 官网: https://novelai.net/
+Novelcrafter pricing: https://www.novelcrafter.com/pricing
+ChatGPT pricing: https://openai.com/chatgpt/pricing
+ChatGPT Plus/Pro: https://help.openai.com/en/articles/6950777-what-is-chatgpt-plus , https://help.openai.com/en/articles/9793128-what-is-chatgpt-pro
+ChatGPT Projects: https://help.openai.com/en/articles/10169521-projects-in-chatgpt
+Claude pricing: https://www.anthropic.com/pricing
+Claude Projects/RAG/Artifacts: https://support.claude.com/en/articles/9517075-what-are-projects , https://support.claude.com/en/articles/11473015-retrieval-augmented-generation-rag-for-projects , https://support.claude.com/en/articles/9487310-what-are-artifacts-and-how-do-i-use-them
+
+
+层级图
+网络图
+时间表。QC 模块是个很好的思路
+
+TODO:
+1、交互式小说允许

@@ -1,7 +1,7 @@
 import os
 import logging
 from pathlib import Path
-from sqlalchemy import create_engine, event, inspect
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import NullPool
 
@@ -34,6 +34,14 @@ else:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+_SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
+    "chapters": {
+        # 024 migration introduced this field. Old selfhost DBs created via create_all()
+        # may miss it and fail ORM SELECTs/INSERTs.
+        "continuation_prompt": "TEXT NOT NULL DEFAULT ''",
+    }
+}
+
 
 def get_db():
     db = SessionLocal()
@@ -41,6 +49,43 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def _ensure_sqlite_schema_compatibility() -> None:
+    """Backfill known SQLite columns that older local DBs may be missing."""
+    if not _is_sqlite:
+        return
+
+    logger = logging.getLogger(__name__)
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+
+    for table_name, required_columns in _SQLITE_COMPAT_COLUMNS.items():
+        if table_name not in table_names:
+            continue
+        existing_columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {table_name} "
+                            f"ADD COLUMN {column_name} {ddl}"
+                        )
+                    )
+                logger.warning(
+                    "Added missing SQLite schema column %s.%s",
+                    table_name,
+                    column_name,
+                )
+            except Exception as exc:  # pragma: no cover - defensive duplicate/race guard
+                if "duplicate column name" in str(exc).lower():
+                    continue
+                raise
 
 
 def init_db():
@@ -52,6 +97,7 @@ def init_db():
             inspector = inspect(engine)
             tables = set(inspector.get_table_names())
             if "novels" in tables:
+                _ensure_sqlite_schema_compatibility()
                 return
             logging.getLogger(__name__).warning(
                 "Database missing core tables; creating schema via metadata.create_all(). "
@@ -61,3 +107,4 @@ def init_db():
             return
 
     Base.metadata.create_all(bind=engine)
+    _ensure_sqlite_schema_compatibility()

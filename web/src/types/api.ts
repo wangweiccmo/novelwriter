@@ -21,6 +21,7 @@ export interface Chapter {
   chapter_number: number
   title: string
   content: string
+  continuation_prompt?: string
   created_at: string
   updated_at: string | null
 }
@@ -29,11 +30,13 @@ export interface ChapterCreateRequest {
   chapter_number?: number
   title?: string
   content?: string
+  continuation_prompt?: string
 }
 
 export interface ChapterUpdateRequest {
   title?: string
   content?: string
+  continuation_prompt?: string
 }
 
 export interface ContinueRequest {
@@ -43,6 +46,7 @@ export interface ContinueRequest {
   max_tokens?: number
   target_chars?: number
   context_chapters?: number
+  context_chapter_numbers?: number[] | string
   temperature?: number
   strict_mode?: boolean
   use_lorebook?: boolean

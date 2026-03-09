@@ -74,7 +74,6 @@ export function NovelDetailPage() {
     queryKey: novelKeys.chaptersMeta(novelId), queryFn: () => api.listChaptersMeta(novelId), enabled: !!novelIdParam,
   })
   const activeChapterNum = selectedChapterNum ?? (chaptersMeta[0]?.chapter_number ?? null)
-  const latestChapterNum = chaptersMeta.length > 0 ? chaptersMeta[chaptersMeta.length - 1].chapter_number : null
 
   const updateChapter = useUpdateChapter(novelId, activeChapterNum ?? 0)
   const createChapter = useCreateChapter(novelId)
@@ -342,8 +341,8 @@ export function NovelDetailPage() {
 
                 <NwButton
                   data-testid="novel-continue-button"
-                  onClick={() => { if (latestChapterNum !== null) navigate(`/novel/${novelId}/chapter/${latestChapterNum}/write`) }}
-                  disabled={latestChapterNum === null}
+                  onClick={() => { if (activeChapterNum !== null) navigate(`/novel/${novelId}/chapter/${activeChapterNum}/write`) }}
+                  disabled={activeChapterNum === null}
                   variant="accent"
                   className="rounded-[10px] px-4 py-2 text-sm font-semibold shadow-[0_0_18px_hsl(var(--accent)/0.25)]"
                 >

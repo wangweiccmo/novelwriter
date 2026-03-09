@@ -53,6 +53,7 @@ class Chapter(Base):
     chapter_number = Column(Integer, nullable=False)
     title = Column(String(255), default="")
     content = Column(Text, nullable=False)
+    continuation_prompt = Column(Text, nullable=False, default="", server_default="")
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 

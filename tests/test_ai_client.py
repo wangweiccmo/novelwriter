@@ -148,6 +148,40 @@ async def test_generate_openai(MockOpenAI, mock_settings):
 
 
 @pytest.mark.asyncio
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_retries_with_provider_max_tokens_limit(MockOpenAI, mock_settings):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+    )
+    mock_settings.return_value = s
+
+    bad_exc = Exception(
+        "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]"
+    )
+    bad_exc.status_code = 400
+
+    ok_response = MagicMock()
+    ok_response.usage = None
+    ok_response.choices = [MagicMock(message=MagicMock(content="Recovered output"), finish_reason="stop")]
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(side_effect=[bad_exc, ok_response])
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    result = await c.generate("Write something", max_tokens=12000)
+
+    assert result == "Recovered output"
+    calls = mock_client_instance.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["max_tokens"] == 12000
+    assert calls[1].kwargs["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
 @patch("app.core.ai_client._record_usage")
 @patch("app.core.ai_client.get_settings")
 @patch("app.core.ai_client.AsyncOpenAI")
@@ -243,6 +277,45 @@ async def test_generate_stream_retries_without_stream_options_on_unsupported_gat
     assert calls[0].kwargs["stream_options"] == {"include_usage": True}
     assert "stream_options" not in calls[1].kwargs
     mock_record_usage.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_stream_retries_with_provider_max_tokens_limit(MockOpenAI, mock_settings):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+    )
+    mock_settings.return_value = s
+
+    bad_exc = Exception(
+        "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]"
+    )
+    bad_exc.status_code = 400
+
+    chunk = MagicMock()
+    chunk.usage = None
+    chunk.choices = [MagicMock(delta=MagicMock(content="X"), finish_reason=None)]
+
+    async def fake_stream():
+        yield chunk
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(side_effect=[bad_exc, fake_stream()])
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    out = []
+    async for token in c.generate_stream("Write something", max_tokens=12000):
+        out.append(token)
+
+    assert "".join(out) == "X"
+    calls = mock_client_instance.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["max_tokens"] == 12000
+    assert calls[1].kwargs["max_tokens"] == 8192
 
 
 # --- Error handling ---
@@ -417,6 +490,50 @@ async def test_generate_structured_retries_then_succeeds(MockOpenAI, mock_settin
 
     assert result.title == "Recovered"
     assert mock_client_instance.chat.completions.create.await_count == 2
+
+
+@pytest.mark.asyncio
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_structured_retries_with_provider_max_tokens_limit(MockOpenAI, mock_settings):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+    )
+    mock_settings.return_value = s
+
+    bad_exc = Exception(
+        "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]"
+    )
+    bad_exc.status_code = 400
+
+    ok_response = MagicMock()
+    ok_response.usage = None
+    ok_response.choices = [
+        MagicMock(message=MagicMock(content=json.dumps(dict(title="Recovered", score=7))), finish_reason="stop")
+    ]
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(
+        side_effect=[bad_exc, ok_response]
+    )
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    result = await c.generate_structured(
+        prompt="Return JSON",
+        response_model=DummyStructuredModel,
+        role="default",
+        max_retries=1,
+        max_tokens=12000,
+    )
+
+    assert result.title == "Recovered"
+    calls = mock_client_instance.chat.completions.create.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["max_tokens"] == 12000
+    assert calls[1].kwargs["max_tokens"] == 8192
 
 
 @pytest.mark.asyncio

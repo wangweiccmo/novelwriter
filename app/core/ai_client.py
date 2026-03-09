@@ -2,6 +2,7 @@ from typing import Literal, Type, TypeVar
 import json
 import os
 import logging
+import re
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 from app.config import get_settings
@@ -41,6 +42,14 @@ _DEFAULT_COST = (0.5, 3)
 _BILLING_SOURCE_HOSTED = "hosted"
 _BILLING_SOURCE_BYOK = "byok"
 _BILLING_SOURCE_SELFHOST = "selfhost"
+_MAX_TOKENS_RANGE_RE = re.compile(
+    r"max_tokens[^\[]*?\[\s*(\d+)\s*,\s*(\d+)\s*\]",
+    re.IGNORECASE,
+)
+_MAX_TOKENS_LEQ_RE = re.compile(
+    r"max_tokens[^0-9]*(?:<=|<|up to|at most)\s*(\d+)",
+    re.IGNORECASE,
+)
 
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -138,6 +147,47 @@ def _stream_options_unsupported(exc: Exception) -> bool:
     )
 
 
+def _extract_max_tokens_upper_bound(exc: Exception) -> int | None:
+    """Best-effort parse of provider-declared max_tokens upper bound from an error."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code not in {None, 400, 422}:
+        return None
+
+    message = str(exc)
+    lowered = message.lower()
+    if "max_tokens" not in lowered:
+        return None
+
+    m = _MAX_TOKENS_RANGE_RE.search(lowered)
+    if m:
+        try:
+            upper = int(m.group(2))
+            if upper >= 1:
+                return upper
+        except Exception:
+            pass
+
+    m = _MAX_TOKENS_LEQ_RE.search(lowered)
+    if m:
+        try:
+            upper = int(m.group(1))
+            if upper >= 1:
+                return upper
+        except Exception:
+            pass
+
+    return None
+
+
+def _max_tokens_retry_value(exc: Exception, requested_max_tokens: int) -> int | None:
+    upper = _extract_max_tokens_upper_bound(exc)
+    if upper is None:
+        return None
+    if requested_max_tokens <= upper:
+        return None
+    return upper
+
+
 class AIClient:
     """
     Multi-model AI client supporting role-based model routing.
@@ -200,15 +250,31 @@ class AIClient:
             base_url=config["base_url"],
             api_key=config["api_key"],
         )
-        response = await client.chat.completions.create(
-            model=config["model"],
-            messages=[
+        request_kwargs = {
+            "model": config["model"],
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        try:
+            response = await client.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            retry_max_tokens = _max_tokens_retry_value(exc, int(request_kwargs["max_tokens"]))
+            if retry_max_tokens is None:
+                raise
+            logger.warning(
+                "Provider rejected max_tokens=%s; retrying with max_tokens=%s",
+                request_kwargs["max_tokens"],
+                retry_max_tokens,
+                extra={"base_url": config["base_url"], "model": config["model"]},
+            )
+            request_kwargs["max_tokens"] = retry_max_tokens
+            response = await client.chat.completions.create(**request_kwargs)
+
+        effective_max_tokens = int(request_kwargs["max_tokens"])
         if response.usage:
             _record_usage(config["model"], response.usage.prompt_tokens,
                           response.usage.completion_tokens, node_name=role, user_id=user_id,
@@ -217,7 +283,7 @@ class AIClient:
         if finish_reason == "length":
             logger.warning(
                 "generate truncated (max_tokens=%s, finish_reason=%s)",
-                max_tokens,
+                effective_max_tokens,
                 finish_reason,
                 extra={"base_url": config["base_url"], "model": config["model"]},
             )
@@ -257,21 +323,40 @@ class AIClient:
             "temperature": temperature,
             "stream": True,
         }
-        try:
-            # Provider-dependent; some OpenAI-compatible gateways 400 on unknown params.
-            stream = await client.chat.completions.create(
-                **request_kwargs,
-                stream_options={"include_usage": True},
-            )
-        except Exception as exc:
-            if not _stream_options_unsupported(exc):
+        include_usage = True
+        max_tokens_retried = False
+        while True:
+            call_kwargs = dict(request_kwargs)
+            if include_usage:
+                call_kwargs["stream_options"] = {"include_usage": True}
+            try:
+                stream = await client.chat.completions.create(**call_kwargs)
+                break
+            except Exception as exc:
+                retry_max_tokens = _max_tokens_retry_value(exc, int(request_kwargs["max_tokens"]))
+                if retry_max_tokens is not None and not max_tokens_retried:
+                    logger.warning(
+                        "Provider rejected max_tokens=%s for streaming; retrying with max_tokens=%s",
+                        request_kwargs["max_tokens"],
+                        retry_max_tokens,
+                        extra={"base_url": config["base_url"], "model": config["model"]},
+                    )
+                    request_kwargs["max_tokens"] = retry_max_tokens
+                    max_tokens_retried = True
+                    continue
+
+                if include_usage and _stream_options_unsupported(exc):
+                    logger.warning(
+                        "Streaming include_usage unsupported; retrying without stream_options",
+                        exc_info=True,
+                        extra={"base_url": config["base_url"], "model": config["model"]},
+                    )
+                    include_usage = False
+                    continue
+
                 raise
-            logger.warning(
-                "Streaming include_usage unsupported; retrying without stream_options",
-                exc_info=True,
-                extra={"base_url": config["base_url"], "model": config["model"]},
-            )
-            stream = await client.chat.completions.create(**request_kwargs)
+
+        effective_max_tokens = int(request_kwargs["max_tokens"])
         prompt_tokens: int | None = None
         completion_tokens: int | None = None
         finish_reason: str | None = None
@@ -299,7 +384,7 @@ class AIClient:
         if finish_reason == "length":
             logger.warning(
                 "generate_stream truncated (max_tokens=%s, finish_reason=%s)",
-                max_tokens,
+                effective_max_tokens,
                 finish_reason,
                 extra={"base_url": config["base_url"], "model": config["model"]},
             )
@@ -343,32 +428,57 @@ class AIClient:
             f"You MUST respond with valid JSON matching this schema:\n{schema_json}"
         )
 
+        effective_max_tokens = int(max_tokens)
         last_request_error: Exception | None = None
         last_parse_error: Exception | None = None
         saw_response = False
 
         for attempt in range(max_retries):
+            request_kwargs = {
+                "model": config["model"],
+                "messages": [
+                    {"role": "system", "content": structured_system},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": effective_max_tokens,
+                "temperature": temperature,
+                "response_format": {"type": "json_object"},
+            }
             try:
-                response = await client.chat.completions.create(
-                    model=config["model"],
-                    messages=[
-                        {"role": "system", "content": structured_system},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    response_format={"type": "json_object"},
-                )
+                response = await client.chat.completions.create(**request_kwargs)
             except Exception as e:
-                last_request_error = e
+                retry_max_tokens = _max_tokens_retry_value(e, int(request_kwargs["max_tokens"]))
+                if retry_max_tokens is None:
+                    last_request_error = e
+                    logger.warning(
+                        "generate_structured request failed (attempt %s/%s)",
+                        attempt + 1,
+                        max_retries,
+                        exc_info=True,
+                        extra={"base_url": config["base_url"], "model": config["model"]},
+                    )
+                    continue
+
                 logger.warning(
-                    "generate_structured request failed (attempt %s/%s)",
-                    attempt + 1,
-                    max_retries,
-                    exc_info=True,
+                    "Provider rejected max_tokens=%s for structured output; retrying with max_tokens=%s",
+                    request_kwargs["max_tokens"],
+                    retry_max_tokens,
                     extra={"base_url": config["base_url"], "model": config["model"]},
                 )
-                continue
+                effective_max_tokens = retry_max_tokens
+                request_kwargs["max_tokens"] = effective_max_tokens
+                try:
+                    response = await client.chat.completions.create(**request_kwargs)
+                except Exception as retry_exc:
+                    last_request_error = retry_exc
+                    logger.warning(
+                        "generate_structured request failed (attempt %s/%s)",
+                        attempt + 1,
+                        max_retries,
+                        exc_info=True,
+                        extra={"base_url": config["base_url"], "model": config["model"]},
+                    )
+                    continue
 
             saw_response = True
             if response.usage:
@@ -388,7 +498,7 @@ class AIClient:
             if finish_reason == "length":
                 logger.warning(
                     "generate_structured truncated (max_tokens=%s, finish_reason=%s, content_len=%s, response_id=%s)",
-                    max_tokens,
+                    effective_max_tokens,
                     finish_reason,
                     len(raw),
                     response_id,
@@ -397,7 +507,7 @@ class AIClient:
                 raise StructuredOutputParseError(
                     max_retries=1,
                     last_error=ValueError(
-                        f"LLM response truncated (finish_reason=length, max_tokens={max_tokens}). "
+                        f"LLM response truncated (finish_reason=length, max_tokens={effective_max_tokens}). "
                         "Increase max_tokens or reduce input."
                     ),
                 )

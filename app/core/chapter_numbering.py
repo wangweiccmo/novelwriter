@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Isaac.X.Ω.Yuan
 # SPDX-License-Identifier: AGPL-3.0-only
 
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
 from app.models import Chapter
@@ -14,7 +15,7 @@ def get_next_missing_chapter_number(db: Session, novel_id: int) -> int:
       - existing {1,3}   -> 2
     """
     rows = (
-        db.query(Chapter.chapter_number)
+        db.query(sa.distinct(Chapter.chapter_number))
         .filter(Chapter.novel_id == novel_id)
         .order_by(Chapter.chapter_number.asc())
         .all()

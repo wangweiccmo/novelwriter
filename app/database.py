@@ -39,8 +39,13 @@ _SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         # 024 migration introduced this field. Old selfhost DBs created via create_all()
         # may miss it and fail ORM SELECTs/INSERTs.
         "continuation_prompt": "TEXT NOT NULL DEFAULT ''",
+        # 025 migration introduced chapter multi-versioning. Old local DBs may miss it.
+        "version_number": "INTEGER NOT NULL DEFAULT 1",
     }
 }
+
+_CHAPTERS_VERSIONED_UNIQUE = ("novel_id", "chapter_number", "version_number")
+_CHAPTERS_LEGACY_UNIQUE = ("novel_id", "chapter_number")
 
 
 def get_db():
@@ -86,6 +91,106 @@ def _ensure_sqlite_schema_compatibility() -> None:
                 if "duplicate column name" in str(exc).lower():
                     continue
                 raise
+
+    _ensure_sqlite_chapter_versioning_constraints(logger=logger)
+
+
+def _ensure_sqlite_chapter_versioning_constraints(*, logger: logging.Logger) -> None:
+    """Repair legacy chapter uniqueness so multi-version writes work on old SQLite DBs."""
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if "chapters" not in table_names:
+        return
+
+    unique_constraints = inspector.get_unique_constraints("chapters")
+    unique_cols = {
+        tuple(str(col).strip() for col in (item.get("column_names") or []) if col)
+        for item in unique_constraints
+    }
+
+    has_versioned_unique = _CHAPTERS_VERSIONED_UNIQUE in unique_cols
+    has_legacy_unique = _CHAPTERS_LEGACY_UNIQUE in unique_cols
+
+    indexes = inspector.get_indexes("chapters")
+    index_names = {str(item.get("name") or "").strip() for item in indexes if item.get("name")}
+    has_versioned_index = "ix_chapters_novel_chapter_version" in index_names
+
+    if has_versioned_unique and has_versioned_index:
+        return
+
+    # If the table does not expose the expected versioned unique constraint, rebuild it
+    # into the current canonical schema. This fixes legacy DBs that still enforce
+    # (novel_id, chapter_number) uniqueness and causes 409 on version append.
+    if not has_versioned_unique:
+        logger.warning(
+            "Repairing legacy SQLite chapter uniqueness constraints for multi-version support"
+        )
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE chapters__compat_new (
+                        id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                        novel_id INTEGER NOT NULL,
+                        chapter_number INTEGER NOT NULL,
+                        version_number INTEGER NOT NULL DEFAULT 1,
+                        title VARCHAR(255),
+                        content TEXT NOT NULL,
+                        continuation_prompt TEXT NOT NULL DEFAULT '',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT uq_chapters_novel_chapter_version
+                            UNIQUE (novel_id, chapter_number, version_number),
+                        FOREIGN KEY(novel_id) REFERENCES novels (id)
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO chapters__compat_new (
+                        id,
+                        novel_id,
+                        chapter_number,
+                        version_number,
+                        title,
+                        content,
+                        continuation_prompt,
+                        created_at,
+                        updated_at
+                    )
+                    SELECT
+                        id,
+                        novel_id,
+                        chapter_number,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY novel_id, chapter_number
+                            ORDER BY COALESCE(version_number, 1), id
+                        ) AS version_number,
+                        title,
+                        content,
+                        COALESCE(continuation_prompt, '') AS continuation_prompt,
+                        created_at,
+                        updated_at
+                    FROM chapters
+                    ORDER BY id
+                    """
+                )
+            )
+            conn.execute(text("DROP TABLE chapters"))
+            conn.execute(text("ALTER TABLE chapters__compat_new RENAME TO chapters"))
+
+    # Always ensure the composite index exists for current query paths.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_chapters_novel_chapter_version
+                ON chapters (novel_id, chapter_number, version_number)
+                """
+            )
+        )
 
 
 def init_db():

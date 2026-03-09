@@ -26,6 +26,8 @@ describe('useCreateChapter', () => {
       id: 101,
       novel_id: novelId,
       chapter_number: 4,
+      version_number: 1,
+      version_count: 1,
       title: payload.title,
       content: payload.content,
       created_at: '2026-02-01T00:00:00Z',

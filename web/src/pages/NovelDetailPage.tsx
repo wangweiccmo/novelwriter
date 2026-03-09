@@ -47,6 +47,7 @@ export function NovelDetailPage() {
   const novelId = Number(novelIdParam)
 
   const [selectedChapterNum, setSelectedChapterNum] = useState<number | null>(null)
+  const [selectedVersionNum, setSelectedVersionNum] = useState<number | null>(null)
   const [editMode, setEditMode] = useState(false)
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
@@ -74,8 +75,17 @@ export function NovelDetailPage() {
     queryKey: novelKeys.chaptersMeta(novelId), queryFn: () => api.listChaptersMeta(novelId), enabled: !!novelIdParam,
   })
   const activeChapterNum = selectedChapterNum ?? (chaptersMeta[0]?.chapter_number ?? null)
+  const { data: chapterVersions = [] } = useQuery({
+    queryKey: ['novels', novelId, 'chapters', activeChapterNum ?? 0, 'versions'],
+    queryFn: () => {
+      if (activeChapterNum === null) throw new Error('Missing active chapter number')
+      return api.listChapterVersions(novelId, activeChapterNum)
+    },
+    enabled: !!novelIdParam && activeChapterNum !== null,
+  })
+  const activeVersionNum = selectedVersionNum ?? (chapterVersions[0]?.version_number ?? null)
 
-  const updateChapter = useUpdateChapter(novelId, activeChapterNum ?? 0)
+  const updateChapter = useUpdateChapter(novelId, activeChapterNum ?? 0, activeVersionNum)
   const createChapter = useCreateChapter(novelId)
   const deleteChapter = useDeleteChapter(novelId)
   const {
@@ -92,13 +102,13 @@ export function NovelDetailPage() {
   })
 
   const { data: chapter, isLoading: chapterLoading } = useQuery({
-    queryKey: novelKeys.chapter(novelId, activeChapterNum ?? 0),
+    queryKey: novelKeys.chapter(novelId, activeChapterNum ?? 0, activeVersionNum),
     queryFn: () => {
       if (activeChapterNum === null) {
         // Guard for type safety; `enabled` prevents this from running in practice.
         throw new Error('Missing active chapter number')
       }
-      return api.getChapter(novelId, activeChapterNum)
+      return api.getChapter(novelId, activeChapterNum, activeVersionNum ?? undefined)
     },
     enabled: !!novelIdParam && activeChapterNum !== null,
   })
@@ -115,6 +125,12 @@ export function NovelDetailPage() {
     // Prevent autosave timers from leaking across chapter switches.
     cancelAutoSave()
   }, [activeChapterNum, cancelAutoSave])
+
+  useEffect(() => {
+    if (selectedVersionNum === null) return
+    const exists = chapterVersions.some(v => v.version_number === selectedVersionNum)
+    if (!exists) setSelectedVersionNum(chapterVersions[0]?.version_number ?? null)
+  }, [chapterVersions, selectedVersionNum])
 
   const handleEditorChange = (val: string) => {
     setEditorContent(val)
@@ -144,10 +160,11 @@ export function NovelDetailPage() {
     } catch { /* ignore */ }
   }
   const handleCreateChapter = () => {
-    createChapter.mutate({ title: '', content: '' }, {
+    createChapter.mutate({ title: '', content: '', after_chapter_number: activeChapterNum ?? undefined }, {
       onSuccess: (nc) => {
         cancelAutoSave()
         setSelectedChapterNum(nc.chapter_number)
+        setSelectedVersionNum(nc.version_number ?? null)
         setEditorContent('')
         setEditMode(true)
       },
@@ -164,12 +181,18 @@ export function NovelDetailPage() {
   const handleDeleteChapter = () => {
     if (activeChapterNum === null) return
     if (!window.confirm(`确定要删除第 ${activeChapterNum} 章吗？此操作无法撤销。`)) return
-    deleteChapter.mutate(activeChapterNum, {
+    deleteChapter.mutate({ chapterNum: activeChapterNum, version: activeVersionNum }, {
       onSuccess: () => {
         cancelAutoSave()
-        const idx = chaptersMeta.findIndex(c => c.chapter_number === activeChapterNum)
-        const next = chaptersMeta[idx + 1] ?? chaptersMeta[idx - 1]
-        setSelectedChapterNum(next?.chapter_number ?? null)
+        if ((currentMeta?.version_count ?? 0) > 1) {
+          // Deleted only one version; stay on this chapter and load the newest remaining version.
+          setSelectedChapterNum(activeChapterNum)
+        } else {
+          const idx = chaptersMeta.findIndex(c => c.chapter_number === activeChapterNum)
+          const next = chaptersMeta[idx + 1] ?? chaptersMeta[idx - 1]
+          setSelectedChapterNum(next?.chapter_number ?? null)
+        }
+        setSelectedVersionNum(null)
         setEditorContent('')
         setEditMode(false)
       },
@@ -265,6 +288,7 @@ export function NovelDetailPage() {
             onSelectChapter={(chapterNumber) => {
               cancelAutoSave()
               setSelectedChapterNum(chapterNumber)
+              setSelectedVersionNum(null)
               setEditingTitle(false)
               setEditorContent('')
               setEditMode(false)
@@ -313,10 +337,29 @@ export function NovelDetailPage() {
                 </div>
                 {currentMeta ? (
                   <div className="text-sm text-muted-foreground">
-                    {editMode ? '编辑中' : '阅读中'} · {wordCount.toLocaleString()} 字{currentMeta.created_at ? ` · ${formatRelativeTime(currentMeta.created_at)}更新` : ''}
+                    {editMode ? '编辑中' : '阅读中'} · {wordCount.toLocaleString()} 字
+                    {activeVersionNum !== null ? ` · v${activeVersionNum}/${currentMeta.version_count}` : ''}
+                    {currentMeta.created_at ? ` · ${formatRelativeTime(currentMeta.created_at)}更新` : ''}
                   </div>
                 ) : null}
               </div>
+
+              {currentMeta && chapterVersions.length > 1 ? (
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-xs text-muted-foreground">版本</span>
+                  <select
+                    className="h-8 rounded-md border border-[var(--nw-glass-border)] bg-[var(--nw-glass-bg)] px-2 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                    value={activeVersionNum ?? ''}
+                    onChange={(e) => setSelectedVersionNum(Number(e.target.value))}
+                  >
+                    {chapterVersions.map((v) => (
+                      <option key={v.id} value={v.version_number}>
+                        v{v.version_number}{v.version_number === currentMeta.latest_version_number ? ' (latest)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : null}
 
               <div className="flex items-center gap-2.5 shrink-0 flex-wrap justify-end">
                 <NwButton

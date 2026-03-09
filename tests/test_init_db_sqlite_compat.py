@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import NullPool
 
 
@@ -79,10 +81,122 @@ def test_init_db_backfills_legacy_chapters_continuation_prompt(
 
     chapter_columns = {col["name"] for col in inspect(legacy_engine).get_columns("chapters")}
     assert "continuation_prompt" in chapter_columns
+    assert "version_number" in chapter_columns
 
     with legacy_engine.begin() as conn:
         prompt_value = conn.execute(
             text("SELECT continuation_prompt FROM chapters WHERE id = 1")
         ).scalar_one()
+        version_value = conn.execute(
+            text("SELECT version_number FROM chapters WHERE id = 1")
+        ).scalar_one()
     assert prompt_value == ""
+    assert version_value == 1
 
+
+def test_init_db_repairs_legacy_chapter_unique_constraint_for_versioning(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from app import database
+
+    db_path = tmp_path / "legacy_unique.db"
+    legacy_engine = create_engine(
+        f"sqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+    )
+
+    with legacy_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE novels (
+                    id INTEGER PRIMARY KEY,
+                    title VARCHAR(255) NOT NULL,
+                    author VARCHAR(255),
+                    file_path VARCHAR(512) NOT NULL,
+                    total_chapters INTEGER,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE chapters (
+                    id INTEGER PRIMARY KEY,
+                    novel_id INTEGER NOT NULL,
+                    chapter_number INTEGER NOT NULL,
+                    version_number INTEGER NOT NULL DEFAULT 1,
+                    title VARCHAR(255),
+                    content TEXT NOT NULL,
+                    continuation_prompt TEXT NOT NULL DEFAULT '',
+                    created_at DATETIME,
+                    updated_at DATETIME,
+                    CONSTRAINT uq_chapters_novel_chapter_number UNIQUE (novel_id, chapter_number)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO novels (id, title, author, file_path, total_chapters)
+                VALUES (1, 'N', '', 'n.txt', 1)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO chapters (id, novel_id, chapter_number, version_number, title, content, continuation_prompt)
+                VALUES (1, 1, 1, 1, 'C1', 'body', '')
+                """
+            )
+        )
+
+    monkeypatch.setattr(database, "engine", legacy_engine)
+    monkeypatch.setattr(database, "_is_sqlite", True)
+    monkeypatch.setattr(
+        "app.config.get_settings",
+        lambda: SimpleNamespace(db_auto_create=False),
+    )
+
+    database.init_db()
+
+    inspector = inspect(legacy_engine)
+    unique_sets = {
+        tuple(col for col in (item.get("column_names") or []) if col)
+        for item in inspector.get_unique_constraints("chapters")
+    }
+    assert ("novel_id", "chapter_number", "version_number") in unique_sets
+    assert ("novel_id", "chapter_number") not in unique_sets
+
+    index_names = {item["name"] for item in inspector.get_indexes("chapters")}
+    assert "ix_chapters_novel_chapter_version" in index_names
+
+    # Should allow multiple rows for same chapter_number as long as version_number differs.
+    with legacy_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO chapters (id, novel_id, chapter_number, version_number, title, content, continuation_prompt)
+                VALUES (2, 1, 1, 2, 'C1 v2', 'body2', '')
+                """
+            )
+        )
+
+    # Still enforces uniqueness per (novel_id, chapter_number, version_number).
+    with pytest.raises(IntegrityError):
+        with legacy_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO chapters (id, novel_id, chapter_number, version_number, title, content, continuation_prompt)
+                    VALUES (3, 1, 1, 2, 'dup', 'dup', '')
+                    """
+                )
+            )

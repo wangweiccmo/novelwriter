@@ -41,6 +41,8 @@ class ChapterResponse(BaseModel):
     id: int
     novel_id: int
     chapter_number: int
+    version_number: int = 1
+    version_count: int = 1
     title: str
     content: str
     continuation_prompt: str = ""
@@ -54,8 +56,22 @@ class ChapterMetaResponse(BaseModel):
     id: int
     novel_id: int
     chapter_number: int
+    latest_version_number: int = 1
+    version_count: int = 1
     title: str
     created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ChapterVersionMetaResponse(BaseModel):
+    id: int
+    novel_id: int
+    chapter_number: int
+    version_number: int
+    title: str
+    created_at: datetime
+    updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -68,6 +84,7 @@ class ChapterUpdateRequest(BaseModel):
 
 class ChapterCreateRequest(BaseModel):
     chapter_number: int | None = None  # default: smallest missing positive chapter number
+    after_chapter_number: int | None = None  # default: chapter_number + 1 when provided
     title: str = ""
     content: str = ""
     continuation_prompt: str = Field(default="", max_length=2000)

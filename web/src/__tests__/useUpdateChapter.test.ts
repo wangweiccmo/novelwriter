@@ -27,6 +27,8 @@ describe('useUpdateChapter', () => {
       id: 99,
       novel_id: novelId,
       chapter_number: chapterNum,
+      version_number: 2,
+      version_count: 3,
       title: '旧标题',
       content: '旧正文',
       created_at: '2026-02-01T00:00:00Z',
@@ -36,6 +38,8 @@ describe('useUpdateChapter', () => {
       id: 99,
       novel_id: novelId,
       chapter_number: chapterNum,
+      latest_version_number: 2,
+      version_count: 3,
       title: '旧标题',
       created_at: '2026-02-01T00:00:00Z',
     }]
@@ -43,6 +47,8 @@ describe('useUpdateChapter', () => {
       id: 99,
       novel_id: novelId,
       chapter_number: chapterNum,
+      version_number: 2,
+      version_count: 3,
       title: payload.title,
       content: payload.content,
       created_at: '2026-02-01T00:00:00Z',
@@ -73,7 +79,7 @@ describe('useUpdateChapter', () => {
       await Promise.resolve()
     })
 
-    expect(mockUpdateChapter).toHaveBeenCalledWith(novelId, chapterNum, payload)
+    expect(mockUpdateChapter).toHaveBeenCalledWith(novelId, chapterNum, payload, undefined)
     expect(queryClient.getQueryData(novelKeys.chapter(novelId, chapterNum))).toMatchObject({
       title: payload.title,
       content: payload.content,
@@ -104,6 +110,8 @@ describe('useUpdateChapter', () => {
       id: 99,
       novel_id: novelId,
       chapter_number: chapterNum,
+      version_number: 2,
+      version_count: 3,
       title: '旧标题',
       content: '旧正文',
       created_at: '2026-02-01T00:00:00Z',
@@ -113,6 +121,8 @@ describe('useUpdateChapter', () => {
       id: 99,
       novel_id: novelId,
       chapter_number: chapterNum,
+      latest_version_number: 2,
+      version_count: 3,
       title: '旧标题',
       created_at: '2026-02-01T00:00:00Z',
     }]

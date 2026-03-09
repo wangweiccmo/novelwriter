@@ -69,7 +69,7 @@ describe('api service', () => {
   })
 
   it('getChapters fetches chapters for a novel', async () => {
-    const chapters = [{ id: 1, novel_id: 1, chapter_number: 1, title: '第一章', content: '内容', created_at: '2026-01-01' }]
+    const chapters = [{ id: 1, novel_id: 1, chapter_number: 1, version_number: 1, version_count: 1, title: '第一章', content: '内容', created_at: '2026-01-01', updated_at: null }]
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(chapters), { status: 200 }))
 
     const result = await api.getChapters(1)

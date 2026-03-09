@@ -12,7 +12,10 @@ export interface Chapter {
   id: number
   novel_id: number
   chapter_number: number
+  version_number?: number
+  version_count?: number
   title: string
   content: string
   created_at: string
+  updated_at?: string | null
 }

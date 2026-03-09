@@ -45,12 +45,14 @@ class Novel(Base):
 class Chapter(Base):
     __tablename__ = "chapters"
     __table_args__ = (
-        UniqueConstraint("novel_id", "chapter_number", name="uq_chapters_novel_chapter_number"),
+        UniqueConstraint("novel_id", "chapter_number", "version_number", name="uq_chapters_novel_chapter_version"),
+        Index("ix_chapters_novel_chapter_version", "novel_id", "chapter_number", "version_number"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     novel_id = Column(Integer, ForeignKey("novels.id"), nullable=False)
     chapter_number = Column(Integer, nullable=False)
+    version_number = Column(Integer, nullable=False, default=1, server_default="1")
     title = Column(String(255), default="")
     content = Column(Text, nullable=False)
     continuation_prompt = Column(Text, nullable=False, default="", server_default="")

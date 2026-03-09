@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
 from pydantic import BaseModel, Field
-from sqlalchemy import or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -812,9 +812,31 @@ def persist_bootstrap_output(
 
 
 def _load_chapters(db: Session, novel_id: int) -> list[ChapterText]:
+    latest_versions_subq = (
+        db.query(
+            Chapter.chapter_number.label("chapter_number"),
+            func.max(Chapter.version_number).label("latest_version_number"),
+        )
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
+    latest_ids_subq = (
+        db.query(func.max(Chapter.id).label("id"))
+        .join(
+            latest_versions_subq,
+            and_(
+                Chapter.chapter_number == latest_versions_subq.c.chapter_number,
+                Chapter.version_number == latest_versions_subq.c.latest_version_number,
+            ),
+        )
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
     rows = (
         db.query(Chapter.id, Chapter.content)
-        .filter(Chapter.novel_id == novel_id)
+        .join(latest_ids_subq, Chapter.id == latest_ids_subq.c.id)
         .order_by(Chapter.chapter_number.asc())
         .all()
     )

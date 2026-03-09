@@ -27,6 +27,7 @@ from app.schemas import (
     NovelResponse,
     ChapterResponse,
     ChapterMetaResponse,
+    ChapterVersionMetaResponse,
     ChapterCreateRequest,
     ChapterUpdateRequest,
     ContinuationResponse,
@@ -118,18 +119,133 @@ def _safe_delete_where(
 
 
 def _latest_chapter_rows_query(db: Session, *, novel_id: int):
-    """Return one row per chapter_number, preferring the latest row (max id).
+    """Return one row per chapter_number, preferring the latest version.
 
     This is a defensive read path for legacy DBs that may still contain duplicate
     (novel_id, chapter_number) rows.
     """
+    latest_versions_subq = (
+        db.query(
+            Chapter.chapter_number.label("chapter_number"),
+            sa.func.max(Chapter.version_number).label("latest_version_number"),
+        )
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
     latest_ids_subq = (
         db.query(sa.func.max(Chapter.id).label("id"))
+        .join(
+            latest_versions_subq,
+            sa.and_(
+                Chapter.chapter_number == latest_versions_subq.c.chapter_number,
+                Chapter.version_number == latest_versions_subq.c.latest_version_number,
+            ),
+        )
         .filter(Chapter.novel_id == novel_id)
         .group_by(Chapter.chapter_number)
         .subquery()
     )
     return db.query(Chapter).join(latest_ids_subq, Chapter.id == latest_ids_subq.c.id)
+
+
+def _chapter_versions_query(db: Session, *, novel_id: int, chapter_number: int):
+    return (
+        db.query(Chapter)
+        .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
+        .order_by(Chapter.version_number.desc(), Chapter.id.desc())
+    )
+
+
+def _chapter_version_aggregates_map(
+    db: Session,
+    *,
+    novel_id: int,
+    chapter_numbers: Sequence[int] | None = None,
+) -> dict[int, tuple[int, int]]:
+    query = (
+        db.query(
+            Chapter.chapter_number.label("chapter_number"),
+            sa.func.count(Chapter.id).label("version_count"),
+            sa.func.max(Chapter.version_number).label("latest_version_number"),
+        )
+        .filter(Chapter.novel_id == novel_id)
+    )
+    if chapter_numbers is not None:
+        normalized = sorted({int(num) for num in chapter_numbers})
+        if not normalized:
+            return {}
+        query = query.filter(Chapter.chapter_number.in_(normalized))
+    rows = query.group_by(Chapter.chapter_number).all()
+    result: dict[int, tuple[int, int]] = {}
+    for row in rows:
+        number = int(row.chapter_number)
+        version_count = int(row.version_count or 0)
+        latest_version = int(row.latest_version_number or 1)
+        result[number] = (version_count, latest_version)
+    return result
+
+
+def _chapter_to_response(chapter: Chapter, *, version_count: int = 1) -> ChapterResponse:
+    return ChapterResponse(
+        id=chapter.id,
+        novel_id=chapter.novel_id,
+        chapter_number=chapter.chapter_number,
+        version_number=int(getattr(chapter, "version_number", 1) or 1),
+        version_count=int(version_count or 1),
+        title=chapter.title,
+        content=chapter.content,
+        continuation_prompt=str(getattr(chapter, "continuation_prompt", "") or ""),
+        created_at=chapter.created_at,
+        updated_at=chapter.updated_at,
+    )
+
+
+def _chapter_to_meta_response(
+    chapter: Chapter,
+    *,
+    version_count: int = 1,
+    latest_version_number: int | None = None,
+) -> ChapterMetaResponse:
+    latest_version = (
+        int(latest_version_number)
+        if latest_version_number is not None
+        else int(getattr(chapter, "version_number", 1) or 1)
+    )
+    return ChapterMetaResponse(
+        id=chapter.id,
+        novel_id=chapter.novel_id,
+        chapter_number=chapter.chapter_number,
+        latest_version_number=latest_version,
+        version_count=int(version_count or 1),
+        title=chapter.title,
+        created_at=chapter.created_at,
+    )
+
+
+def _resolve_chapter_by_version(
+    db: Session,
+    *,
+    novel_id: int,
+    chapter_number: int,
+    version: int | None,
+) -> Chapter | None:
+    if version is None:
+        return (
+            _latest_chapter_rows_query(db, novel_id=novel_id)
+            .filter(Chapter.chapter_number == chapter_number)
+            .first()
+        )
+    return (
+        db.query(Chapter)
+        .filter(
+            Chapter.novel_id == novel_id,
+            Chapter.chapter_number == chapter_number,
+            Chapter.version_number == version,
+        )
+        .order_by(Chapter.id.desc())
+        .first()
+    )
 
 
 def _recompute_total_chapters(db: Session, *, novel_id: int) -> int:
@@ -978,7 +1094,19 @@ def get_chapters(
     )
     if limit is not None:
         query = query.limit(limit)
-    return query.all()
+    chapters = query.all()
+    aggregates = _chapter_version_aggregates_map(
+        db,
+        novel_id=novel_id,
+        chapter_numbers=[chapter.chapter_number for chapter in chapters],
+    )
+    return [
+        _chapter_to_response(
+            chapter,
+            version_count=aggregates.get(chapter.chapter_number, (1, 1))[0],
+        )
+        for chapter in chapters
+    ]
 
 
 @router.get("/{novel_id}/chapters/meta", response_model=List[ChapterMetaResponse])
@@ -1001,15 +1129,56 @@ def get_chapters_meta(
     if limit is not None:
         query = query.limit(limit)
     chapters = query.all()
+    aggregates = _chapter_version_aggregates_map(
+        db,
+        novel_id=novel_id,
+        chapter_numbers=[chapter.chapter_number for chapter in chapters],
+    )
     return [
-        ChapterMetaResponse(
+        _chapter_to_meta_response(
+            chapter,
+            version_count=aggregates.get(chapter.chapter_number, (1, 1))[0],
+            latest_version_number=aggregates.get(chapter.chapter_number, (1, 1))[1],
+        )
+        for chapter in chapters
+    ]
+
+
+@router.get(
+    "/{novel_id}/chapters/{chapter_number}/versions",
+    response_model=List[ChapterVersionMetaResponse],
+)
+def list_chapter_versions(
+    novel_id: int,
+    chapter_number: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_or_default),
+) -> List[ChapterVersionMetaResponse]:
+    """List all versions for a chapter (newest first)."""
+    novel = db.query(Novel).filter(Novel.id == novel_id).first()
+    _verify_novel_access(novel, current_user)
+
+    versions = _chapter_versions_query(
+        db,
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+    ).all()
+    if not versions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chapter {chapter_number} not found in novel {novel_id}",
+        )
+    return [
+        ChapterVersionMetaResponse(
             id=chapter.id,
             novel_id=chapter.novel_id,
             chapter_number=chapter.chapter_number,
+            version_number=int(getattr(chapter, "version_number", 1) or 1),
             title=chapter.title,
             created_at=chapter.created_at,
+            updated_at=chapter.updated_at,
         )
-        for chapter in chapters
+        for chapter in versions
     ]
 
 
@@ -1017,6 +1186,7 @@ def get_chapters_meta(
 def get_chapter(
     novel_id: int,
     chapter_number: int,
+    version: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user_or_default),
 ):
@@ -1024,17 +1194,28 @@ def get_chapter(
     novel = db.query(Novel).filter(Novel.id == novel_id).first()
     _verify_novel_access(novel, current_user)
 
-    chapter = (
-        _latest_chapter_rows_query(db, novel_id=novel_id)
-        .filter(Chapter.chapter_number == chapter_number)
-        .first()
+    chapter = _resolve_chapter_by_version(
+        db,
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        version=version,
     )
     if not chapter:
+        detail = (
+            f"Chapter {chapter_number} version {version} not found in novel {novel_id}"
+            if version is not None
+            else f"Chapter {chapter_number} not found in novel {novel_id}"
+        )
         raise HTTPException(
             status_code=404,
-            detail=f"Chapter {chapter_number} not found in novel {novel_id}"
+            detail=detail,
         )
-    return chapter
+    version_count = _chapter_version_aggregates_map(
+        db,
+        novel_id=novel_id,
+        chapter_numbers=[chapter_number],
+    ).get(chapter_number, (1, 1))[0]
+    return _chapter_to_response(chapter, version_count=version_count)
 
 
 @router.post("/{novel_id}/chapters", response_model=ChapterResponse, status_code=201)
@@ -1047,75 +1228,71 @@ def create_chapter(
     """Create a new chapter for a novel."""
     novel = db.query(Novel).filter(Novel.id == novel_id).first()
     _verify_novel_access(novel, current_user)
+    title_explicitly_provided = "title" in req.model_fields_set
 
+    if req.chapter_number is not None and req.after_chapter_number is not None:
+        raise HTTPException(status_code=400, detail="chapter_number and after_chapter_number cannot both be set")
     if req.chapter_number is not None and req.chapter_number < 1:
         raise HTTPException(status_code=400, detail="chapter_number must be >= 1")
+    if req.after_chapter_number is not None and req.after_chapter_number < 1:
+        raise HTTPException(status_code=400, detail="after_chapter_number must be >= 1")
 
-    # Auto-numbering fills the smallest missing positive chapter number.
-    if req.chapter_number is None:
-        # Defensive retry: concurrent auto-creates may race on the same number.
-        for attempt in range(3):
-            chapter_number = get_next_missing_chapter_number(db, novel_id)
-            chapter = Chapter(
-                novel_id=novel_id,
-                chapter_number=chapter_number,
-                title=req.title,
-                content=req.content,
-                continuation_prompt=req.continuation_prompt,
-            )
-            db.add(chapter)
+    if req.chapter_number is not None:
+        chapter_number = req.chapter_number
+    elif req.after_chapter_number is not None:
+        chapter_number = req.after_chapter_number + 1
+    else:
+        # Preserve current default for API clients that do not pass an anchor.
+        chapter_number = get_next_missing_chapter_number(db, novel_id)
+
+    # New writes always append as a new version under the target chapter_number.
+    for attempt in range(3):
+        latest_chapter = (
+            _chapter_versions_query(db, novel_id=novel_id, chapter_number=chapter_number)
+            .first()
+        )
+        next_version = int(getattr(latest_chapter, "version_number", 0) or 0) + 1
+        resolved_title = req.title
+        # Keep title stable when appending a version and caller omitted title.
+        # This matches "adopt continuation" semantics: new正文版本, same章节标题.
+        if not title_explicitly_provided and latest_chapter is not None:
+            resolved_title = str(getattr(latest_chapter, "title", "") or "")
+        chapter = Chapter(
+            novel_id=novel_id,
+            chapter_number=chapter_number,
+            version_number=next_version,
+            title=resolved_title,
+            content=req.content,
+            continuation_prompt=req.continuation_prompt,
+        )
+        db.add(chapter)
+        try:
+            db.flush()
+            _recompute_total_chapters(db, novel_id=novel_id)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
             try:
-                db.flush()  # surface unique constraint failures before commit
-                _recompute_total_chapters(db, novel_id=novel_id)
-                db.commit()
-            except IntegrityError:
-                db.rollback()
-                # Ensure the failed pending object doesn't get re-flushed on retry.
-                try:
-                    db.expunge(chapter)
-                except Exception:
-                    pass
-                if attempt < 2:
-                    continue
-                raise HTTPException(
-                    status_code=409,
-                    detail="Chapter number conflict; please retry",
-                )
+                db.expunge(chapter)
+            except Exception:
+                pass
+            if attempt < 2:
+                continue
+            raise HTTPException(
+                status_code=409,
+                detail="Chapter version conflict; please retry",
+            )
 
-            db.refresh(chapter)
-            return chapter
+        db.refresh(chapter)
+        version_count = int(
+            db.query(sa.func.count(Chapter.id))
+            .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
+            .scalar()
+            or 1
+        )
+        return _chapter_to_response(chapter, version_count=version_count)
 
-        # Unreachable; loop always returns or raises.
-        raise HTTPException(status_code=409, detail="Chapter number conflict; please retry")
-
-    chapter_number = req.chapter_number
-
-    existing = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
-        .first()
-    )
-    if existing:
-        raise HTTPException(status_code=409, detail=f"Chapter {chapter_number} already exists")
-
-    chapter = Chapter(
-        novel_id=novel_id,
-        chapter_number=chapter_number,
-        title=req.title,
-        content=req.content,
-        continuation_prompt=req.continuation_prompt,
-    )
-    db.add(chapter)
-    try:
-        db.flush()
-        _recompute_total_chapters(db, novel_id=novel_id)
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=409, detail=f"Chapter {chapter_number} already exists")
-
-    db.refresh(chapter)
-    return chapter
+    raise HTTPException(status_code=409, detail="Chapter version conflict; please retry")
 
 
 @router.put("/{novel_id}/chapters/{chapter_number}", response_model=ChapterResponse)
@@ -1123,6 +1300,7 @@ def update_chapter(
     novel_id: int,
     chapter_number: int,
     req: ChapterUpdateRequest,
+    version: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user_or_default),
 ):
@@ -1130,16 +1308,21 @@ def update_chapter(
     novel = db.query(Novel).filter(Novel.id == novel_id).first()
     _verify_novel_access(novel, current_user)
 
-    chapters = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
-        .order_by(Chapter.id.desc())
-        .all()
+    chapter = _resolve_chapter_by_version(
+        db,
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        version=version,
     )
-    if not chapters:
+    if not chapter:
+        detail = (
+            f"Chapter {chapter_number} version {version} not found in novel {novel_id}"
+            if version is not None
+            else f"Chapter {chapter_number} not found in novel {novel_id}"
+        )
         raise HTTPException(
             status_code=404,
-            detail=f"Chapter {chapter_number} not found in novel {novel_id}",
+            detail=detail,
         )
 
     if req.title is None and req.content is None and req.continuation_prompt is None:
@@ -1148,63 +1331,63 @@ def update_chapter(
             detail="Must provide title and/or content and/or continuation_prompt",
         )
 
-    for chapter in chapters:
-        if req.title is not None:
-            chapter.title = req.title
-        if req.content is not None:
-            chapter.content = req.content
-        if req.continuation_prompt is not None:
-            chapter.continuation_prompt = req.continuation_prompt
+    if req.title is not None:
+        chapter.title = req.title
+    if req.content is not None:
+        chapter.content = req.content
+    if req.continuation_prompt is not None:
+        chapter.continuation_prompt = req.continuation_prompt
 
     db.commit()
-    latest_chapter = chapters[0]
-    db.refresh(latest_chapter)
-    if len(chapters) > 1:
-        logger.warning(
-            "Updated duplicate chapter rows for novel=%s chapter_number=%s count=%s",
-            novel_id,
-            chapter_number,
-            len(chapters),
-        )
-    record_event(db, current_user.id, "chapter_save", novel_id=novel_id, meta={"chapter": chapter_number})
-    return latest_chapter
+    db.refresh(chapter)
+    version_count = _chapter_version_aggregates_map(
+        db,
+        novel_id=novel_id,
+        chapter_numbers=[chapter_number],
+    ).get(chapter_number, (1, 1))[0]
+    record_event(
+        db,
+        current_user.id,
+        "chapter_save",
+        novel_id=novel_id,
+        meta={"chapter": chapter_number, "version": int(getattr(chapter, "version_number", 1) or 1)},
+    )
+    return _chapter_to_response(chapter, version_count=version_count)
 
 
 @router.delete("/{novel_id}/chapters/{chapter_number}", status_code=204)
 def delete_chapter(
     novel_id: int,
     chapter_number: int,
+    version: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user_or_default),
 ):
-    """Delete a chapter from a novel."""
+    """Delete one chapter version from a novel."""
     novel = db.query(Novel).filter(Novel.id == novel_id).first()
     _verify_novel_access(novel, current_user)
 
-    chapters = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id, Chapter.chapter_number == chapter_number)
-        .order_by(Chapter.id.desc())
-        .all()
+    chapter = _resolve_chapter_by_version(
+        db,
+        novel_id=novel_id,
+        chapter_number=chapter_number,
+        version=version,
     )
-    if not chapters:
+    if not chapter:
+        detail = (
+            f"Chapter {chapter_number} version {version} not found in novel {novel_id}"
+            if version is not None
+            else f"Chapter {chapter_number} not found in novel {novel_id}"
+        )
         raise HTTPException(
             status_code=404,
-            detail=f"Chapter {chapter_number} not found in novel {novel_id}",
+            detail=detail,
         )
+    db.delete(chapter)
 
-    for chapter in chapters:
-        db.delete(chapter)
     db.flush()
     _recompute_total_chapters(db, novel_id=novel_id)
     db.commit()
-    if len(chapters) > 1:
-        logger.warning(
-            "Deleted duplicate chapter rows for novel=%s chapter_number=%s count=%s",
-            novel_id,
-            chapter_number,
-            len(chapters),
-        )
     return Response(status_code=204)
 
 

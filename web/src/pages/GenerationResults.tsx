@@ -25,7 +25,7 @@ interface VariantState {
 }
 
 export function GenerationResults() {
-  const { novelId } = useParams<{ novelId: string; chapterNum: string }>()
+  const { novelId, chapterNum } = useParams<{ novelId: string; chapterNum: string }>()
   const navigate = useNavigate()
   const location = useLocation()
   const { user, refreshQuota } = useAuth()
@@ -243,11 +243,13 @@ export function GenerationResults() {
 
   const adoptMutation = useMutation({
     mutationFn: () => {
-      if (!novelId || !currentContent) {
+      const anchorChapterNumber = Number(chapterNum)
+      if (!novelId || !currentContent || !Number.isFinite(anchorChapterNumber) || anchorChapterNumber < 1) {
         throw new Error('No continuation version to adopt')
       }
       return api.createChapter(Number(novelId), {
         content: currentContent,
+        after_chapter_number: anchorChapterNumber,
       })
     },
     onSuccess: () => {

@@ -75,6 +75,8 @@ class TestCreateChapter:
         assert resp.status_code == 201
         data = resp.json()
         assert data["chapter_number"] == 3
+        assert data["version_number"] == 1
+        assert data["version_count"] == 1
         assert data["title"] == "第三章"
         assert data["content"] == "内容三"
         assert data["novel_id"] == novel.id
@@ -91,6 +93,8 @@ class TestCreateChapter:
         assert resp.status_code == 201
         data = resp.json()
         assert data["chapter_number"] == 3  # total_chapters was 2
+        assert data["version_number"] == 1
+        assert data["version_count"] == 1
 
         db.refresh(novel)
         assert novel.total_chapters == 3
@@ -116,16 +120,66 @@ class TestCreateChapter:
         assert resp.status_code == 201
         data = resp.json()
         assert data["chapter_number"] == 2
+        assert data["version_number"] == 1
+        assert data["version_count"] == 1
 
         db.refresh(novel)
         assert novel.total_chapters == 3
 
-    def test_create_chapter_duplicate_number(self, client, novel):
+    def test_create_chapter_duplicate_number_creates_new_version(self, client, db, novel):
         resp = client.post(
             f"/api/novels/{novel.id}/chapters",
             json={"chapter_number": 1, "title": "重复", "content": "重复内容"},
         )
-        assert resp.status_code == 409
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["chapter_number"] == 1
+        assert data["version_number"] == 2
+        assert data["version_count"] == 2
+
+        db.refresh(novel)
+        assert novel.total_chapters == 2
+
+    def test_create_chapter_after_current_keeps_existing_as_versions(self, client, db, novel):
+        resp = client.post(
+            f"/api/novels/{novel.id}/chapters",
+            json={"after_chapter_number": 1, "title": "第二章新版本", "content": "第二章新内容"},
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["chapter_number"] == 2
+        assert data["version_number"] == 2
+        assert data["version_count"] == 2
+
+        versions = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel.id, Chapter.chapter_number == 2)
+            .order_by(Chapter.version_number.asc())
+            .all()
+        )
+        assert [item.version_number for item in versions] == [1, 2]
+        assert versions[-1].content == "第二章新内容"
+
+
+    def test_create_chapter_after_current_without_title_inherits_latest_title(self, client, db, novel):
+        latest = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel.id, Chapter.chapter_number == 2)
+            .order_by(Chapter.version_number.desc(), Chapter.id.desc())
+            .first()
+        )
+        assert latest is not None
+        expected_title = latest.title
+
+        resp = client.post(
+            f"/api/novels/{novel.id}/chapters",
+            json={"after_chapter_number": 1, "content": "new-version-content"},
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["chapter_number"] == 2
+        assert data["version_number"] == 2
+        assert data["title"] == expected_title
 
 
 class TestUpdateChapter:
@@ -174,6 +228,32 @@ class TestUpdateChapter:
         )
         assert resp.status_code == 404
 
+    def test_update_specific_version(self, client, db, novel):
+        db.add(Chapter(novel_id=novel.id, chapter_number=1, version_number=2, title="第一章v2", content="新版本"))
+        db.commit()
+
+        resp = client.put(
+            f"/api/novels/{novel.id}/chapters/1?version=1",
+            json={"content": "仅更新v1"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["version_number"] == 1
+        assert data["content"] == "仅更新v1"
+
+        v1 = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel.id, Chapter.chapter_number == 1, Chapter.version_number == 1)
+            .first()
+        )
+        v2 = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel.id, Chapter.chapter_number == 1, Chapter.version_number == 2)
+            .first()
+        )
+        assert v1 is not None and v1.content == "仅更新v1"
+        assert v2 is not None and v2.content == "新版本"
+
 
 class TestDeleteChapter:
     def test_delete_chapter(self, client, db, novel):
@@ -190,6 +270,62 @@ class TestDeleteChapter:
         )
         assert chapter is None
 
+    def test_delete_chapter_without_version_only_deletes_latest_version(self, client, db, novel):
+        db.add(Chapter(novel_id=novel.id, chapter_number=2, version_number=2, title="第二章v2", content="v2"))
+        db.commit()
+
+        resp = client.delete(f"/api/novels/{novel.id}/chapters/2")
+        assert resp.status_code == 204
+
+        remained = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel.id, Chapter.chapter_number == 2)
+            .order_by(Chapter.version_number.asc())
+            .all()
+        )
+        assert len(remained) == 1
+        assert remained[0].version_number == 1
+
+        db.refresh(novel)
+        assert novel.total_chapters == 2
+
     def test_delete_chapter_not_found(self, client, novel):
         resp = client.delete(f"/api/novels/{novel.id}/chapters/99")
         assert resp.status_code == 404
+
+    def test_delete_specific_version(self, client, db, novel):
+        db.add(Chapter(novel_id=novel.id, chapter_number=2, version_number=2, title="第二章v2", content="v2"))
+        db.commit()
+
+        resp = client.delete(f"/api/novels/{novel.id}/chapters/2?version=1")
+        assert resp.status_code == 204
+
+        remained = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel.id, Chapter.chapter_number == 2)
+            .order_by(Chapter.version_number.asc())
+            .all()
+        )
+        assert len(remained) == 1
+        assert remained[0].version_number == 2
+
+
+class TestChapterVersions:
+    def test_list_chapter_versions(self, client, db, novel):
+        db.add(Chapter(novel_id=novel.id, chapter_number=2, version_number=2, title="第二章v2", content="v2"))
+        db.commit()
+
+        resp = client.get(f"/api/novels/{novel.id}/chapters/2/versions")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert [item["version_number"] for item in payload] == [2, 1]
+
+    def test_get_chapter_by_version(self, client, db, novel):
+        db.add(Chapter(novel_id=novel.id, chapter_number=2, version_number=2, title="第二章v2", content="v2"))
+        db.commit()
+
+        resp = client.get(f"/api/novels/{novel.id}/chapters/2?version=1")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["version_number"] == 1
+        assert data["content"] == "内容二"

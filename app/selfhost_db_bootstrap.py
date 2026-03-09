@@ -47,7 +47,7 @@ _LEGACY_TABLES = {
 }
 _REQUIRED_SCHEMA_COLUMNS: dict[str, set[str]] = {
     "novels": {"owner_id", "window_index"},
-    "chapters": {"continuation_prompt"},
+    "chapters": {"continuation_prompt", "version_number"},
     "world_entities": {"origin", "worldpack_pack_id", "worldpack_key"},
     "world_entity_attributes": {"surface", "origin", "worldpack_pack_id"},
     "world_relationships": {"origin", "worldpack_pack_id", "label_canonical"},

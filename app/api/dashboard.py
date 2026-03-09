@@ -12,7 +12,7 @@ Provides aggregated data to reduce multiple API calls from frontend:
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -77,10 +77,33 @@ async def get_novel_dashboard(
         lorebook=ComponentStatus(ready=lorebook_count > 0, count=lorebook_count),
     )
 
+    latest_versions_subq = (
+        db.query(
+            Chapter.chapter_number.label("chapter_number"),
+            func.max(Chapter.version_number).label("latest_version_number"),
+        )
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
+    latest_ids_subq = (
+        db.query(func.max(Chapter.id).label("id"))
+        .join(
+            latest_versions_subq,
+            and_(
+                Chapter.chapter_number == latest_versions_subq.c.chapter_number,
+                Chapter.version_number == latest_versions_subq.c.latest_version_number,
+            ),
+        )
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
+
     # Get recent chapters
     recent_chapters_db = (
         db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id)
+        .join(latest_ids_subq, Chapter.id == latest_ids_subq.c.id)
         .order_by(Chapter.chapter_number.desc())
         .limit(recent_chapters_limit)
         .all()

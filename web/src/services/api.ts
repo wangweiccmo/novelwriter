@@ -2,6 +2,7 @@ import type {
   Novel,
   Chapter,
   ChapterMeta,
+  ChapterVersionMeta,
   ChapterCreateRequest,
   ChapterUpdateRequest,
   ContinueRequest,
@@ -191,20 +192,24 @@ export const api = {
     request<ChapterMeta[]>(`/api/novels/${novelId}/chapters/meta`),
   listChapters,
   getChapters: listChapters,
-  getChapter: (novelId: number, num: number) =>
-    request<Chapter>(`/api/novels/${novelId}/chapters/${num}`),
+  getChapter: (novelId: number, num: number, version?: number) => {
+    const qs = version != null ? `?version=${encodeURIComponent(String(version))}` : ''
+    return request<Chapter>(`/api/novels/${novelId}/chapters/${num}${qs}`)
+  },
+  listChapterVersions: (novelId: number, num: number) =>
+    request<ChapterVersionMeta[]>(`/api/novels/${novelId}/chapters/${num}/versions`),
   createChapter: (novelId: number, data: ChapterCreateRequest) =>
     request<Chapter>(`/api/novels/${novelId}/chapters`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  updateChapter: (novelId: number, num: number, data: ChapterUpdateRequest) =>
-    request<Chapter>(`/api/novels/${novelId}/chapters/${num}`, {
+  updateChapter: (novelId: number, num: number, data: ChapterUpdateRequest, version?: number) =>
+    request<Chapter>(`/api/novels/${novelId}/chapters/${num}${version != null ? `?version=${encodeURIComponent(String(version))}` : ''}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
-  deleteChapter: (novelId: number, num: number) =>
-    request<void>(`/api/novels/${novelId}/chapters/${num}`, { method: 'DELETE' }),
+  deleteChapter: (novelId: number, num: number, version?: number) =>
+    request<void>(`/api/novels/${novelId}/chapters/${num}${version != null ? `?version=${encodeURIComponent(String(version))}` : ''}`, { method: 'DELETE' }),
 
   continueNovel: (novelId: number, data: ContinueRequest) =>
     request<ContinueResponse>(`/api/novels/${novelId}/continue`, {

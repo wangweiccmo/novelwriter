@@ -238,6 +238,7 @@ export async function mockAllApiRoutes(page: Page) {
   await page.route('**/api/**', route => route.abort('blockedbyclient'))
 
   await mockAuthRoutes(page)
+  const chapters = CHAPTERS.map(c => ({ ...c }))
 
   // Override with known routes (later routes take priority in Playwright)
   await page.route('**/api/novels', route => {
@@ -259,24 +260,117 @@ export async function mockAllApiRoutes(page: Page) {
 
   await page.route('**/api/novels/1/chapters/meta', route => {
     if (route.request().method() !== 'GET') return route.abort('blockedbyclient')
-    return route.fulfill({
-      json: CHAPTERS.map((c) => ({
+    const latestByChapter = new Map<number, (typeof chapters)[number]>()
+    for (const ch of chapters) {
+      const prev = latestByChapter.get(ch.chapter_number)
+      if (!prev || (ch.version_number ?? 0) > (prev.version_number ?? 0)) {
+        latestByChapter.set(ch.chapter_number, ch)
+      }
+    }
+    const metas = Array.from(latestByChapter.values())
+      .sort((a, b) => a.chapter_number - b.chapter_number)
+      .map((c) => ({
         id: c.id,
         novel_id: c.novel_id,
         chapter_number: c.chapter_number,
+        latest_version_number: c.version_number ?? 1,
+        version_count: chapters.filter(v => v.chapter_number === c.chapter_number).length,
         title: c.title,
         created_at: c.created_at,
+      }))
+    return route.fulfill({
+      json: metas,
+    })
+  })
+
+  await page.route('**/api/novels/1/chapters', async route => {
+    const method = route.request().method()
+    if (method === 'GET') {
+      const latestByChapter = new Map<number, (typeof chapters)[number]>()
+      for (const ch of chapters) {
+        const prev = latestByChapter.get(ch.chapter_number)
+        if (!prev || (ch.version_number ?? 0) > (prev.version_number ?? 0)) {
+          latestByChapter.set(ch.chapter_number, ch)
+        }
+      }
+      const payload = Array.from(latestByChapter.values())
+        .sort((a, b) => a.chapter_number - b.chapter_number)
+        .map((c) => ({
+          ...c,
+          version_count: chapters.filter(v => v.chapter_number === c.chapter_number).length,
+        }))
+      return route.fulfill({ json: payload })
+    }
+    if (method === 'POST') {
+      let payload: Record<string, unknown> = {}
+      try {
+        payload = route.request().postDataJSON() as Record<string, unknown>
+      } catch {
+        payload = {}
+      }
+      const explicitChapter = typeof payload.chapter_number === 'number' ? payload.chapter_number : null
+      const afterChapter = typeof payload.after_chapter_number === 'number' ? payload.after_chapter_number : null
+      const targetChapter = explicitChapter ?? (afterChapter != null ? afterChapter + 1 : (chapters[chapters.length - 1]?.chapter_number ?? 0) + 1)
+      const existingVersions = chapters.filter(c => c.chapter_number === targetChapter)
+      const latestVersion = existingVersions.reduce((max, item) => Math.max(max, item.version_number ?? 0), 0)
+      const nextVersion = latestVersion + 1
+      const nextVersionCount = existingVersions.length + 1
+      const nextId = Math.max(...chapters.map(c => c.id), 0) + 1
+      const created = {
+        id: nextId,
+        novel_id: 1,
+        chapter_number: targetChapter,
+        version_number: nextVersion,
+        version_count: nextVersionCount,
+        title: String(payload.title ?? ''),
+        content: String(payload.content ?? ''),
+        created_at: new Date().toISOString(),
+        updated_at: null,
+      }
+      chapters.push(created)
+      for (const ch of chapters) {
+        if (ch.chapter_number === targetChapter) {
+          ch.version_count = nextVersionCount
+        }
+      }
+      return route.fulfill({ status: 201, json: created })
+    }
+    return route.abort('blockedbyclient')
+  })
+
+  await page.route('**/api/novels/1/chapters/*/versions', route => {
+    const match = route.request().url().match(/\/chapters\/(\d+)\/versions/)
+    const chapterNumber = match ? Number(match[1]) : 0
+    const versions = chapters
+      .filter(c => c.chapter_number === chapterNumber)
+      .sort((a, b) => (b.version_number ?? 0) - (a.version_number ?? 0))
+    const chapter = versions[0] ?? chapters[0]
+    if (!chapter) return route.fulfill({ status: 404, json: { detail: 'not found' } })
+    return route.fulfill({
+      json: versions.map(v => ({
+        id: v.id,
+        novel_id: v.novel_id,
+        chapter_number: v.chapter_number,
+        version_number: v.version_number ?? 1,
+        title: v.title,
+        created_at: v.created_at,
+        updated_at: v.updated_at ?? null,
       })),
     })
   })
 
-  await page.route('**/api/novels/1/chapters', route =>
-    route.fulfill({ json: CHAPTERS })
-  )
-
-  await page.route('**/api/novels/1/chapters/1', route =>
-    route.fulfill({ json: CHAPTERS[0] })
-  )
+  await page.route('**/api/novels/1/chapters/*', route => {
+    const match = route.request().url().match(/\/chapters\/(\d+)(?:\?version=(\d+))?$/)
+    if (!match) return route.fallback()
+    const chapterNumber = Number(match[1])
+    const versionNumber = match[2] ? Number(match[2]) : null
+    const candidates = chapters.filter(c => c.chapter_number === chapterNumber)
+    const chapter = versionNumber != null
+      ? candidates.find(c => c.version_number === versionNumber)
+      : candidates.sort((a, b) => (b.version_number ?? 0) - (a.version_number ?? 0))[0]
+    if (!chapter) return route.fulfill({ status: 404, json: { detail: 'not found' } })
+    return route.fulfill({ json: chapter })
+  })
 
   // World model defaults (empty world, no bootstrap job).
   await page.route('**/api/novels/1/world/entities**', route => {

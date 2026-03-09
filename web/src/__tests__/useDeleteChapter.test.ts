@@ -22,6 +22,7 @@ describe('useDeleteChapter', () => {
   it('deletes chapter and invalidates chapter metadata list + novel detail', async () => {
     const novelId = 7
     const chapterNum = 4
+    const versionNum = 2
     mockDeleteChapter.mockResolvedValue(undefined)
 
     const queryClient = createTestQueryClient()
@@ -32,10 +33,10 @@ describe('useDeleteChapter', () => {
     })
 
     await act(async () => {
-      await result.current.mutateAsync(chapterNum)
+      await result.current.mutateAsync({ chapterNum, version: versionNum })
     })
 
-    expect(mockDeleteChapter).toHaveBeenCalledWith(novelId, chapterNum)
+    expect(mockDeleteChapter).toHaveBeenCalledWith(novelId, chapterNum, versionNum)
     expect(invalidateQueriesSpy).toHaveBeenCalledWith({ queryKey: novelKeys.chaptersMeta(novelId) })
     expect(invalidateQueriesSpy).toHaveBeenCalledWith({ queryKey: novelKeys.detail(novelId) })
   })
@@ -52,7 +53,7 @@ describe('useDeleteChapter', () => {
       wrapper: createQueryClientWrapper(queryClient),
     })
 
-    await expect(result.current.mutateAsync(chapterNum)).rejects.toThrow('delete failed')
+    await expect(result.current.mutateAsync({ chapterNum, version: 1 })).rejects.toThrow('delete failed')
     expect(invalidateQueriesSpy).not.toHaveBeenCalled()
   })
 })

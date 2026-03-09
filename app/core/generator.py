@@ -13,6 +13,7 @@ from typing import Any, AsyncGenerator, List
 import asyncio
 import math
 import re
+import sqlalchemy as sa
 from sqlalchemy.orm import Session
 import logging
 
@@ -28,6 +29,32 @@ logger = logging.getLogger(__name__)
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def _latest_chapter_rows_query(db: Session, *, novel_id: int):
+    latest_versions_subq = (
+        db.query(
+            Chapter.chapter_number.label("chapter_number"),
+            sa.func.max(Chapter.version_number).label("latest_version_number"),
+        )
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
+    latest_ids_subq = (
+        db.query(sa.func.max(Chapter.id).label("id"))
+        .join(
+            latest_versions_subq,
+            sa.and_(
+                Chapter.chapter_number == latest_versions_subq.c.chapter_number,
+                Chapter.version_number == latest_versions_subq.c.latest_version_number,
+            ),
+        )
+        .filter(Chapter.novel_id == novel_id)
+        .group_by(Chapter.chapter_number)
+        .subquery()
+    )
+    return db.query(Chapter).join(latest_ids_subq, Chapter.id == latest_ids_subq.c.id)
 
 
 def _continue_log_extra(
@@ -149,9 +176,8 @@ async def generate_outline(
 ) -> Outline:
     """Generate outline for specified chapter range."""
     chapters = (
-        db.query(Chapter)
+        _latest_chapter_rows_query(db, novel_id=novel_id)
         .filter(
-            Chapter.novel_id == novel_id,
             Chapter.chapter_number >= chapter_start,
             Chapter.chapter_number <= chapter_end,
         )
@@ -246,8 +272,7 @@ async def _build_continuation_prompt(
             default=settings.max_context_chapters,
         )
         recent_chapters = (
-            db.query(Chapter)
-            .filter(Chapter.novel_id == novel_id)
+            _latest_chapter_rows_query(db, novel_id=novel_id)
             .order_by(Chapter.chapter_number.desc())
             .limit(effective_context_chapters)
             .all()
@@ -747,8 +772,8 @@ async def generate_all_outlines(db: Session, novel_id: int) -> List[Outline]:
     chapter_numbers = [
         n
         for (n,) in (
-            db.query(Chapter.chapter_number)
-            .filter(Chapter.novel_id == novel_id)
+            _latest_chapter_rows_query(db, novel_id=novel_id)
+            .with_entities(Chapter.chapter_number)
             .order_by(Chapter.chapter_number)
             .all()
         )

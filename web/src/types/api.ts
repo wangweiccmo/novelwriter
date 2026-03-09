@@ -11,6 +11,8 @@ export interface ChapterMeta {
   id: number
   novel_id: number
   chapter_number: number
+  latest_version_number: number
+  version_count: number
   title: string
   created_at: string
 }
@@ -19,6 +21,8 @@ export interface Chapter {
   id: number
   novel_id: number
   chapter_number: number
+  version_number: number
+  version_count: number
   title: string
   content: string
   continuation_prompt?: string
@@ -26,8 +30,19 @@ export interface Chapter {
   updated_at: string | null
 }
 
+export interface ChapterVersionMeta {
+  id: number
+  novel_id: number
+  chapter_number: number
+  version_number: number
+  title: string
+  created_at: string
+  updated_at: string | null
+}
+
 export interface ChapterCreateRequest {
   chapter_number?: number
+  after_chapter_number?: number
   title?: string
   content?: string
   continuation_prompt?: string

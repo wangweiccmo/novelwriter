@@ -49,6 +49,7 @@ def _create_legacy_tables_and_seed() -> None:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     novel_id INTEGER NOT NULL,
                     chapter_number INTEGER NOT NULL,
+                    version_number INTEGER NOT NULL DEFAULT 1,
                     title VARCHAR(255) DEFAULT '',
                     content TEXT NOT NULL,
                     continuation_prompt TEXT NOT NULL DEFAULT '',
@@ -69,11 +70,11 @@ def _create_legacy_tables_and_seed() -> None:
         conn.execute(
             sa.text(
                 """
-                INSERT INTO chapters (id, novel_id, chapter_number, title, content, continuation_prompt)
+                INSERT INTO chapters (id, novel_id, chapter_number, version_number, title, content, continuation_prompt)
                 VALUES
-                    (11, 1, 1, 'Chapter 1', 'chapter-1-content', 'chapter-1-prompt'),
-                    (21, 1, 2, 'Chapter 2 old', 'chapter-2-old-content', 'chapter-2-old-prompt'),
-                    (22, 1, 2, 'Chapter 2 new', 'chapter-2-new-content', 'chapter-2-new-prompt')
+                    (11, 1, 1, 1, 'Chapter 1', 'chapter-1-content', 'chapter-1-prompt'),
+                    (21, 1, 2, 1, 'Chapter 2 old', 'chapter-2-old-content', 'chapter-2-old-prompt'),
+                    (22, 1, 2, 2, 'Chapter 2 new', 'chapter-2-new-content', 'chapter-2-new-prompt')
                 """
             )
         )
@@ -124,6 +125,8 @@ def test_get_chapter_prefers_latest_duplicate_row(client):
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["id"] == 22
+    assert payload["version_number"] == 2
+    assert payload["version_count"] == 2
     assert payload["content"] == "chapter-2-new-content"
     assert payload["continuation_prompt"] == "chapter-2-new-prompt"
 
@@ -136,10 +139,12 @@ def test_get_chapters_deduplicates_legacy_rows(client):
     assert [item["chapter_number"] for item in payload] == [1, 2]
     chapter_2 = next(item for item in payload if item["chapter_number"] == 2)
     assert chapter_2["id"] == 22
+    assert chapter_2["version_number"] == 2
+    assert chapter_2["version_count"] == 2
     assert chapter_2["content"] == "chapter-2-new-content"
 
 
-def test_update_chapter_updates_all_duplicate_rows(client, db):
+def test_update_chapter_updates_latest_version_only(client, db):
     resp = client.put(
         "/api/novels/1/chapters/2",
         json={"content": "chapter-2-updated", "continuation_prompt": "prompt-updated"},
@@ -147,38 +152,45 @@ def test_update_chapter_updates_all_duplicate_rows(client, db):
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["id"] == 22
+    assert payload["version_number"] == 2
     assert payload["content"] == "chapter-2-updated"
     assert payload["continuation_prompt"] == "prompt-updated"
 
     rows = db.execute(
         sa.text(
             """
-            SELECT id, content, continuation_prompt
+            SELECT id, version_number, content, continuation_prompt
             FROM chapters
             WHERE novel_id = 1 AND chapter_number = 2
-            ORDER BY id
+            ORDER BY version_number
             """
         )
     ).fetchall()
     assert len(rows) == 2
-    assert all(row.content == "chapter-2-updated" for row in rows)
-    assert all(row.continuation_prompt == "prompt-updated" for row in rows)
+    assert rows[0].version_number == 1
+    assert rows[0].content == "chapter-2-old-content"
+    assert rows[1].version_number == 2
+    assert rows[1].content == "chapter-2-updated"
+    assert rows[1].continuation_prompt == "prompt-updated"
 
 
-def test_delete_chapter_removes_all_duplicate_rows_and_recomputes_total(client, db):
+def test_delete_chapter_without_version_removes_latest_row_only_and_recomputes_total(client, db):
     resp = client.delete("/api/novels/1/chapters/2")
     assert resp.status_code == 204
 
-    chapter_count = db.execute(
+    rows = db.execute(
         sa.text(
             """
-            SELECT COUNT(*) AS c
+            SELECT id, version_number, content
             FROM chapters
             WHERE novel_id = 1 AND chapter_number = 2
+            ORDER BY version_number ASC
             """
         )
-    ).scalar_one()
-    assert chapter_count == 0
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0].version_number == 1
+    assert rows[0].content == "chapter-2-old-content"
 
     total_chapters = db.execute(
         sa.text(
@@ -189,4 +201,4 @@ def test_delete_chapter_removes_all_duplicate_rows_and_recomputes_total(client, 
             """
         )
     ).scalar_one()
-    assert total_chapters == 1
+    assert total_chapters == 2

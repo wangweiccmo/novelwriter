@@ -284,7 +284,9 @@ sequenceDiagram
 ### 7.4 可观测性
 
 - 请求级日志附带 request_id。
+- 续写链路关键日志统一输出 `request_id/novel_id/user_id/variant/attempt`（logger `extra`）。
 - 关键行为写入 `user_events`，支持漏斗分析与运营复盘。
+- 续写新增事件：`continue_strict_retry`、`continue_strict_fail`、`continue_lore_enabled`。
 
 ## 8. 部署与发布架构
 
@@ -332,4 +334,3 @@ sequenceDiagram
 - Bootstrap 任务与应用进程同生命周期，重启后依赖“陈旧任务恢复”机制。
 - SQLite 适合 selfhost，重并发 hosted 场景建议 PostgreSQL。
 - 流式接口连接生命周期较长，前置网关需正确配置超时策略。
-

@@ -27,7 +27,8 @@ from app.core.bootstrap import (
 from app.core.auth import (
     get_current_user_or_default,
     check_generation_quota,
-    decrement_quota,
+    finalize_quota_reservation,
+    open_quota_reservation,
     reserve_quota,
     refund_quota,
 )
@@ -1632,7 +1633,6 @@ async def trigger_bootstrap(
 
     async with lock:
         _get_novel(novel_id, db)
-        decrement_quota(db, current_user, count=1)
 
         if not _has_non_empty_chapter_text(novel_id, db):
             raise HTTPException(
@@ -1693,6 +1693,42 @@ async def trigger_bootstrap(
             job = BootstrapJob(novel_id=novel_id)
             db.add(job)
 
+        previous_reservation_id: int | None = None
+        if getattr(job, "quota_reservation_id", None) is not None:
+            try:
+                previous_reservation_id = int(job.quota_reservation_id)
+            except Exception:
+                previous_reservation_id = None
+
+        reservation_id: int | None = None
+        reservation_attached = False
+        try:
+            reservation_id = open_quota_reservation(db, current_user.id, count=1)
+
+            if previous_reservation_id is not None and previous_reservation_id != reservation_id:
+                try:
+                    finalize_quota_reservation(db, previous_reservation_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to finalize previous bootstrap reservation before retrigger",
+                        exc_info=True,
+                        extra={"novel_id": novel_id, "job_id": job.id, "reservation_id": previous_reservation_id},
+                    )
+
+            job.quota_reservation_id = reservation_id
+            reservation_attached = True
+        except Exception:
+            if reservation_id is not None and not reservation_attached:
+                try:
+                    finalize_quota_reservation(db, reservation_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to rollback bootstrap reservation after trigger failure",
+                        exc_info=True,
+                        extra={"novel_id": novel_id, "reservation_id": reservation_id},
+                    )
+            raise
+
         job.mode = mode
         job.draft_policy = draft_policy.value if draft_policy else None
         job.status = "pending"
@@ -1708,6 +1744,15 @@ async def trigger_bootstrap(
             db.commit()
         except IntegrityError:
             db.rollback()
+            if reservation_id is not None:
+                try:
+                    finalize_quota_reservation(db, reservation_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to rollback bootstrap reservation after trigger conflict",
+                        exc_info=True,
+                        extra={"novel_id": novel_id, "reservation_id": reservation_id},
+                    )
             existing_job = db.query(BootstrapJob).filter(BootstrapJob.novel_id == novel_id).first()
             if existing_job and is_running_status(existing_job.status):
                 raise HTTPException(
@@ -1724,6 +1769,18 @@ async def trigger_bootstrap(
                     "Bootstrap trigger conflict, please retry",
                 ),
             )
+        except Exception:
+            db.rollback()
+            if reservation_id is not None:
+                try:
+                    finalize_quota_reservation(db, reservation_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to rollback bootstrap reservation after trigger failure",
+                        exc_info=True,
+                        extra={"novel_id": novel_id, "reservation_id": reservation_id},
+                    )
+            raise
 
         db.refresh(job)
 

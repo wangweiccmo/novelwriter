@@ -354,6 +354,54 @@ def finalize_quota_reservation(db: Session, reservation_id: int) -> tuple[int, i
     return charged, unused
 
 
+def charge_quota_reservation(db: Session, reservation_id: int, *, count: int = 1) -> int:
+    """Persist a successful delivery against an open reservation.
+
+    Returns the updated charged_count.
+    """
+    if count <= 0:
+        reservation = (
+            db.query(QuotaReservation)
+            .filter(QuotaReservation.id == reservation_id)
+            .first()
+        )
+        return int(getattr(reservation, "charged_count", 0) or 0)
+
+    reservation = (
+        db.query(QuotaReservation)
+        .filter(QuotaReservation.id == reservation_id)
+        .first()
+    )
+    if reservation is None:
+        raise RuntimeError("Quota reservation not found")
+    if reservation.released_at is not None:
+        raise RuntimeError("Quota reservation already finalized")
+
+    result = db.execute(
+        sa.update(QuotaReservation)
+        .where(
+            QuotaReservation.id == reservation_id,
+            QuotaReservation.released_at.is_(None),
+            QuotaReservation.charged_count + count <= QuotaReservation.reserved_count,
+        )
+        .values(
+            charged_count=QuotaReservation.charged_count + count,
+            updated_at=sa.func.now(),
+        )
+    )
+    if result.rowcount <= 0:
+        db.rollback()
+        raise RuntimeError("Failed to persist quota charge")
+
+    db.commit()
+    refreshed = (
+        db.query(QuotaReservation)
+        .filter(QuotaReservation.id == reservation_id)
+        .first()
+    )
+    return int(getattr(refreshed, "charged_count", 0) or 0)
+
+
 class QuotaScope:
     """Tracks how many variants were actually delivered during a generation.
 
@@ -396,24 +444,7 @@ class QuotaScope:
             self.charged = next_total
             return
 
-        result = self.db.execute(
-            sa.update(QuotaReservation)
-            .where(
-                QuotaReservation.id == self.reservation_id,
-                QuotaReservation.released_at.is_(None),
-                QuotaReservation.charged_count + n <= QuotaReservation.reserved_count,
-            )
-            .values(
-                charged_count=QuotaReservation.charged_count + n,
-                updated_at=sa.func.now(),
-            )
-        )
-        if result.rowcount <= 0:
-            self.db.rollback()
-            raise RuntimeError("Failed to persist quota charge")
-
-        self.db.commit()
-        self.charged = next_total
+        self.charged = charge_quota_reservation(self.db, self.reservation_id, count=n)
 
     def finalize(self) -> None:
         """Refund unreceived variants. Safe to call multiple times."""

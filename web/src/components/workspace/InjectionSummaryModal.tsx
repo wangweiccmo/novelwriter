@@ -127,6 +127,13 @@ export function InjectionSummaryModal({ onClose, debug, novelId }: InjectionSumm
           {/* Divider */}
           <div className="h-px bg-[var(--nw-glass-border)] mx-6" />
 
+          {/* Lore summary */}
+          <div className="px-6 pt-3 pb-1">
+            <div className="rounded-lg border border-[var(--nw-glass-border)] bg-[var(--nw-glass-bg)] px-3 py-2 text-xs text-muted-foreground">
+              Lore 注入：{debug.lore_hits} 条，约 {debug.lore_tokens_used} tokens
+            </div>
+          </div>
+
           {/* Items list */}
           <div className="flex-1 min-h-0 overflow-y-auto nw-scrollbar-thin px-6 py-4">
             {currentItems.length === 0 ? (

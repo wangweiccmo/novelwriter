@@ -1,7 +1,9 @@
 from typing import Literal, Type, TypeVar
+import asyncio
 import json
 import os
 import logging
+import random
 import re
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -50,6 +52,7 @@ _MAX_TOKENS_LEQ_RE = re.compile(
     r"max_tokens[^0-9]*(?:<=|<|up to|at most)\s*(\d+)",
     re.IGNORECASE,
 )
+_TRANSIENT_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -188,6 +191,88 @@ def _max_tokens_retry_value(exc: Exception, requested_max_tokens: int) -> int | 
     return upper
 
 
+def _resolve_status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    code = getattr(response, "status_code", None)
+    return code if isinstance(code, int) else None
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return True
+    message = str(exc).lower()
+    return "timed out" in message or "timeout" in message
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    if _is_timeout_error(exc):
+        return True
+    status_code = _resolve_status_code(exc)
+    if status_code in _TRANSIENT_STATUS_CODES:
+        return True
+    message = str(exc).lower()
+    return any(
+        hint in message
+        for hint in (
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "server disconnected",
+            "try again",
+            "rate limit",
+        )
+    )
+
+
+def _coerce_positive_int(value: object, default: int) -> int:
+    if not isinstance(value, (int, float, str)):
+        return default
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
+def _coerce_positive_float(value: object, default: float) -> float:
+    if not isinstance(value, (int, float, str)):
+        return default
+    try:
+        parsed = float(value)
+    except Exception:
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
+def _retry_budget() -> tuple[int, int]:
+    settings = get_settings()
+    retry_attempts = _coerce_positive_int(getattr(settings, "llm_retry_attempts", 2), 2)
+    retry_base_ms = _coerce_positive_int(getattr(settings, "llm_retry_base_ms", 300), 300)
+    return retry_attempts, retry_base_ms
+
+
+def _request_timeout_seconds() -> float:
+    settings = get_settings()
+    return _coerce_positive_float(getattr(settings, "llm_request_timeout_seconds", 60.0), 60.0)
+
+
+def _retry_sleep_seconds(*, retry_index: int, base_ms: int) -> float:
+    # Exponential backoff + bounded jitter.
+    base = (base_ms / 1000.0) * (2 ** max(0, retry_index))
+    jitter = min(0.25, base * 0.2) * random.random()
+    return base + jitter
+
+
 class AIClient:
     """
     Multi-model AI client supporting role-based model routing.
@@ -246,9 +331,11 @@ class AIClient:
             using_request_override=bool(base_url and api_key and model),
         )
         config = self._resolve_config(base_url, api_key, model)
+        retry_attempts, retry_base_ms = _retry_budget()
         client = AsyncOpenAI(
             base_url=config["base_url"],
             api_key=config["api_key"],
+            timeout=_request_timeout_seconds(),
         )
         request_kwargs = {
             "model": config["model"],
@@ -259,20 +346,42 @@ class AIClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        try:
-            response = await client.chat.completions.create(**request_kwargs)
-        except Exception as exc:
-            retry_max_tokens = _max_tokens_retry_value(exc, int(request_kwargs["max_tokens"]))
-            if retry_max_tokens is None:
+        max_tokens_retried = False
+        transient_retry_count = 0
+        while True:
+            try:
+                response = await client.chat.completions.create(**request_kwargs)
+                break
+            except Exception as exc:
+                retry_max_tokens = _max_tokens_retry_value(exc, int(request_kwargs["max_tokens"]))
+                if retry_max_tokens is not None and not max_tokens_retried:
+                    logger.warning(
+                        "Provider rejected max_tokens=%s; retrying with max_tokens=%s",
+                        request_kwargs["max_tokens"],
+                        retry_max_tokens,
+                        extra={"base_url": config["base_url"], "model": config["model"]},
+                    )
+                    request_kwargs["max_tokens"] = retry_max_tokens
+                    max_tokens_retried = True
+                    continue
+
+                if _is_transient_llm_error(exc) and transient_retry_count < retry_attempts:
+                    delay_s = _retry_sleep_seconds(
+                        retry_index=transient_retry_count,
+                        base_ms=retry_base_ms,
+                    )
+                    transient_retry_count += 1
+                    logger.warning(
+                        "generate transient error (attempt %s/%s), retrying in %.2fs",
+                        transient_retry_count,
+                        retry_attempts,
+                        delay_s,
+                        extra={"base_url": config["base_url"], "model": config["model"]},
+                    )
+                    await asyncio.sleep(delay_s)
+                    continue
+
                 raise
-            logger.warning(
-                "Provider rejected max_tokens=%s; retrying with max_tokens=%s",
-                request_kwargs["max_tokens"],
-                retry_max_tokens,
-                extra={"base_url": config["base_url"], "model": config["model"]},
-            )
-            request_kwargs["max_tokens"] = retry_max_tokens
-            response = await client.chat.completions.create(**request_kwargs)
 
         effective_max_tokens = int(request_kwargs["max_tokens"])
         if response.usage:
@@ -309,9 +418,11 @@ class AIClient:
             using_request_override=bool(base_url and api_key and model),
         )
         config = self._resolve_config(base_url, api_key, model)
+        retry_attempts, retry_base_ms = _retry_budget()
         client = AsyncOpenAI(
             base_url=config["base_url"],
             api_key=config["api_key"],
+            timeout=_request_timeout_seconds(),
         )
         request_kwargs = {
             "model": config["model"],
@@ -325,6 +436,7 @@ class AIClient:
         }
         include_usage = True
         max_tokens_retried = False
+        transient_retry_count = 0
         while True:
             call_kwargs = dict(request_kwargs)
             if include_usage:
@@ -352,6 +464,22 @@ class AIClient:
                         extra={"base_url": config["base_url"], "model": config["model"]},
                     )
                     include_usage = False
+                    continue
+
+                if _is_transient_llm_error(exc) and transient_retry_count < retry_attempts:
+                    delay_s = _retry_sleep_seconds(
+                        retry_index=transient_retry_count,
+                        base_ms=retry_base_ms,
+                    )
+                    transient_retry_count += 1
+                    logger.warning(
+                        "generate_stream transient error (attempt %s/%s), retrying in %.2fs",
+                        transient_retry_count,
+                        retry_attempts,
+                        delay_s,
+                        extra={"base_url": config["base_url"], "model": config["model"]},
+                    )
+                    await asyncio.sleep(delay_s)
                     continue
 
                 raise
@@ -417,9 +545,11 @@ class AIClient:
             using_request_override=bool(base_url and api_key and model),
         )
         config = self._resolve_config(base_url, api_key, model)
+        retry_attempts, retry_base_ms = _retry_budget()
         client = AsyncOpenAI(
             base_url=config["base_url"],
             api_key=config["api_key"],
+            timeout=_request_timeout_seconds(),
         )
 
         schema_json = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
@@ -444,11 +574,43 @@ class AIClient:
                 "temperature": temperature,
                 "response_format": {"type": "json_object"},
             }
-            try:
-                response = await client.chat.completions.create(**request_kwargs)
-            except Exception as e:
-                retry_max_tokens = _max_tokens_retry_value(e, int(request_kwargs["max_tokens"]))
-                if retry_max_tokens is None:
+            response = None
+            max_tokens_retried = False
+            transient_retry_count = 0
+            while True:
+                try:
+                    response = await client.chat.completions.create(**request_kwargs)
+                    break
+                except Exception as e:
+                    retry_max_tokens = _max_tokens_retry_value(e, int(request_kwargs["max_tokens"]))
+                    if retry_max_tokens is not None and not max_tokens_retried:
+                        logger.warning(
+                            "Provider rejected max_tokens=%s for structured output; retrying with max_tokens=%s",
+                            request_kwargs["max_tokens"],
+                            retry_max_tokens,
+                            extra={"base_url": config["base_url"], "model": config["model"]},
+                        )
+                        effective_max_tokens = retry_max_tokens
+                        request_kwargs["max_tokens"] = effective_max_tokens
+                        max_tokens_retried = True
+                        continue
+
+                    if _is_transient_llm_error(e) and transient_retry_count < retry_attempts:
+                        delay_s = _retry_sleep_seconds(
+                            retry_index=transient_retry_count,
+                            base_ms=retry_base_ms,
+                        )
+                        transient_retry_count += 1
+                        logger.warning(
+                            "generate_structured transient error (attempt %s/%s), retrying in %.2fs",
+                            transient_retry_count,
+                            retry_attempts,
+                            delay_s,
+                            extra={"base_url": config["base_url"], "model": config["model"]},
+                        )
+                        await asyncio.sleep(delay_s)
+                        continue
+
                     last_request_error = e
                     logger.warning(
                         "generate_structured request failed (attempt %s/%s)",
@@ -457,28 +619,10 @@ class AIClient:
                         exc_info=True,
                         extra={"base_url": config["base_url"], "model": config["model"]},
                     )
-                    continue
+                    break
 
-                logger.warning(
-                    "Provider rejected max_tokens=%s for structured output; retrying with max_tokens=%s",
-                    request_kwargs["max_tokens"],
-                    retry_max_tokens,
-                    extra={"base_url": config["base_url"], "model": config["model"]},
-                )
-                effective_max_tokens = retry_max_tokens
-                request_kwargs["max_tokens"] = effective_max_tokens
-                try:
-                    response = await client.chat.completions.create(**request_kwargs)
-                except Exception as retry_exc:
-                    last_request_error = retry_exc
-                    logger.warning(
-                        "generate_structured request failed (attempt %s/%s)",
-                        attempt + 1,
-                        max_retries,
-                        exc_info=True,
-                        extra={"base_url": config["base_url"], "model": config["model"]},
-                    )
-                    continue
+            if response is None:
+                continue
 
             saw_response = True
             if response.usage:

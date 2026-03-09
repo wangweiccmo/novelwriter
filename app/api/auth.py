@@ -196,7 +196,15 @@ class PreferencesRequest(BaseModel):
     preferences: dict
 
 
-ALLOWED_PREFERENCE_KEYS = {"num_versions", "temperature", "context_chapters", "target_chars"}
+ALLOWED_PREFERENCE_KEYS = {
+    "num_versions",
+    "temperature",
+    "context_chapters",
+    "target_chars",
+    "length_mode",
+    "strict_mode",
+    "use_lorebook",
+}
 
 
 @router.patch("/preferences", response_model=UserResponse)

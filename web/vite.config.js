@@ -18,7 +18,7 @@ export default defineConfig({
         proxy: {
             '/api': {
                 target: (_a = process.env.NOVWR_DEV_API_TARGET) !== null && _a !== void 0 ? _a : 'http://127.0.0.1:8000',
-                changeOrigin: true,
+                changeOrigin: false,
             },
         },
     },

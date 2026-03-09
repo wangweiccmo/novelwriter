@@ -1,11 +1,12 @@
 """Tests for app/core/ai_client.py — AIClient generate() and model routing."""
 
+import asyncio
 import json
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from pydantic import BaseModel
-from app.core.ai_client import AIClient, _estimate_cost, get_client
+from app.core.ai_client import AIClient, LLMUnavailableError, _estimate_cost, get_client
 
 
 @pytest.fixture
@@ -182,6 +183,74 @@ async def test_generate_retries_with_provider_max_tokens_limit(MockOpenAI, mock_
 
 
 @pytest.mark.asyncio
+@patch("app.core.ai_client.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_retries_on_transient_503_then_succeeds(
+    MockOpenAI, mock_settings, mock_sleep
+):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+        llm_retry_attempts=2,
+        llm_retry_base_ms=1,
+        llm_request_timeout_seconds=30.0,
+    )
+    mock_settings.return_value = s
+
+    transient_exc = Exception("Service unavailable")
+    transient_exc.status_code = 503
+
+    ok_response = MagicMock()
+    ok_response.usage = None
+    ok_response.choices = [MagicMock(message=MagicMock(content="Recovered"), finish_reason="stop")]
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(side_effect=[transient_exc, ok_response])
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    result = await c.generate("Write something")
+
+    assert result == "Recovered"
+    assert mock_client_instance.chat.completions.create.await_count == 2
+    mock_sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch("app.core.ai_client.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_stops_after_transient_retry_budget_exhausted(
+    MockOpenAI, mock_settings, mock_sleep
+):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+        llm_retry_attempts=1,
+        llm_retry_base_ms=1,
+        llm_request_timeout_seconds=30.0,
+    )
+    mock_settings.return_value = s
+
+    transient_exc = Exception("Service unavailable")
+    transient_exc.status_code = 503
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(side_effect=[transient_exc, transient_exc])
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    with pytest.raises(Exception, match="Service unavailable"):
+        await c.generate("Write something")
+
+    assert mock_client_instance.chat.completions.create.await_count == 2
+    mock_sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @patch("app.core.ai_client._record_usage")
 @patch("app.core.ai_client.get_settings")
 @patch("app.core.ai_client.AsyncOpenAI")
@@ -316,6 +385,47 @@ async def test_generate_stream_retries_with_provider_max_tokens_limit(MockOpenAI
     assert len(calls) == 2
     assert calls[0].kwargs["max_tokens"] == 12000
     assert calls[1].kwargs["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
+@patch("app.core.ai_client.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_stream_retries_on_transient_429_then_succeeds(
+    MockOpenAI, mock_settings, mock_sleep
+):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+        llm_retry_attempts=2,
+        llm_retry_base_ms=1,
+        llm_request_timeout_seconds=30.0,
+    )
+    mock_settings.return_value = s
+
+    transient_exc = Exception("rate limit")
+    transient_exc.status_code = 429
+
+    chunk = MagicMock()
+    chunk.usage = None
+    chunk.choices = [MagicMock(delta=MagicMock(content="Z"), finish_reason=None)]
+
+    async def fake_stream():
+        yield chunk
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(side_effect=[transient_exc, fake_stream()])
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    out = []
+    async for token in c.generate_stream("Write something"):
+        out.append(token)
+
+    assert "".join(out) == "Z"
+    assert mock_client_instance.chat.completions.create.await_count == 2
+    mock_sleep.assert_awaited_once()
 
 
 # --- Error handling ---
@@ -534,6 +644,82 @@ async def test_generate_structured_retries_with_provider_max_tokens_limit(MockOp
     assert len(calls) == 2
     assert calls[0].kwargs["max_tokens"] == 12000
     assert calls[1].kwargs["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
+@patch("app.core.ai_client.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_structured_retries_on_timeout_then_succeeds(
+    MockOpenAI, mock_settings, mock_sleep
+):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+        llm_retry_attempts=1,
+        llm_retry_base_ms=1,
+        llm_request_timeout_seconds=30.0,
+    )
+    mock_settings.return_value = s
+
+    timeout_exc = asyncio.TimeoutError("timed out")
+    ok_response = MagicMock()
+    ok_response.usage = None
+    ok_response.choices = [
+        MagicMock(message=MagicMock(content=json.dumps(dict(title="Recovered", score=7))), finish_reason="stop")
+    ]
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(side_effect=[timeout_exc, ok_response])
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    result = await c.generate_structured(
+        prompt="Return JSON",
+        response_model=DummyStructuredModel,
+        role="default",
+        max_retries=1,
+    )
+
+    assert result.title == "Recovered"
+    assert mock_client_instance.chat.completions.create.await_count == 2
+    mock_sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@patch("app.core.ai_client.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.core.ai_client.get_settings")
+@patch("app.core.ai_client.AsyncOpenAI")
+async def test_generate_structured_raises_llm_unavailable_after_transient_retry_budget_exhausted(
+    MockOpenAI, mock_settings, mock_sleep
+):
+    s = MagicMock(
+        openai_base_url="https://api.openai.com/v1",
+        openai_api_key="sk-test",
+        openai_model="gpt-4o",
+        llm_retry_attempts=1,
+        llm_retry_base_ms=1,
+        llm_request_timeout_seconds=30.0,
+    )
+    mock_settings.return_value = s
+
+    timeout_exc = asyncio.TimeoutError("timed out")
+    mock_client_instance = MagicMock()
+    mock_client_instance.chat.completions.create = AsyncMock(side_effect=[timeout_exc, timeout_exc])
+    MockOpenAI.return_value = mock_client_instance
+
+    c = AIClient()
+    with pytest.raises(LLMUnavailableError, match="LLM request failed after 1 retries"):
+        await c.generate_structured(
+            prompt="Return JSON",
+            response_model=DummyStructuredModel,
+            role="default",
+            max_retries=1,
+        )
+
+    assert mock_client_instance.chat.completions.create.await_count == 2
+    mock_sleep.assert_awaited_once()
 
 
 @pytest.mark.asyncio

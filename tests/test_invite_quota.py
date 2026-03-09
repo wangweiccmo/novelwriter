@@ -295,6 +295,33 @@ class TestInviteRegistration:
         assert patch_resp.status_code == 200
         assert patch_resp.json()["preferences"]["context_chapters"] == 5
 
+    def test_preferences_accept_new_continuation_keys(self, hosted_client):
+        resp = hosted_client.post("/api/auth/invite", json={
+            "invite_code": "TEST-CODE-123",
+            "nickname": "偏好新字段测试",
+        })
+        token = resp.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        patch_resp = hosted_client.patch(
+            "/api/auth/preferences",
+            json={
+                "preferences": {
+                    "length_mode": "custom",
+                    "strict_mode": True,
+                    "use_lorebook": True,
+                    "target_chars": 2600,
+                }
+            },
+            headers=headers,
+        )
+        assert patch_resp.status_code == 200
+        prefs = patch_resp.json()["preferences"]
+        assert prefs["length_mode"] == "custom"
+        assert prefs["strict_mode"] is True
+        assert prefs["use_lorebook"] is True
+        assert prefs["target_chars"] == 2600
+
 
 class TestQuota:
     def test_quota_endpoint(self, hosted_client):

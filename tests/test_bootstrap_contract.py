@@ -248,7 +248,7 @@ async def test_bootstrap_rejects_initial_mode_after_initialization(world_api, db
             body=BootstrapTriggerRequest(mode="initial"),
             db=db,
             current_user=user,
-    )
+        )
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["code"] == "bootstrap_initial_mode_not_allowed"

@@ -9,6 +9,8 @@ import { AdvancedRow } from '@/components/workspace/AdvancedRow'
 import { PageShell } from '@/components/layout/PageShell'
 import { NwButton } from '@/components/ui/nw-button'
 import { Textarea } from '@/components/ui/textarea'
+import { Input } from '@/components/ui/input'
+import { Checkbox } from '@/components/ui/checkbox'
 import { PlainTextContent } from '@/components/ui/plain-text-content'
 import { cn } from '@/lib/utils'
 import { api } from '@/services/api'
@@ -31,6 +33,10 @@ const LENGTH_OPTIONS: LengthOption[] = [
 const MIN_CONTEXT_CHAPTERS = 1
 const MAX_CONTEXT_CHAPTERS = 5
 const DEFAULT_CONTEXT_CHAPTERS = 5
+const MIN_TARGET_CHARS = 800
+const MAX_TARGET_CHARS = 8000
+const DEFAULT_TARGET_CHARS = 3000
+const MAX_NUM_VERSIONS = 4
 
 const DEMO_NOVEL_TITLE = '西游记'
 const DEMO_DEFAULT_INSTRUCTION =
@@ -42,7 +48,24 @@ const DEMO_DEFAULT_INSTRUCTION =
 function resolveTargetChars(selected: string): number {
   const opt = LENGTH_OPTIONS.find(o => o.value === selected)
   if (opt) return parseInt(opt.value, 10)
-  return 3000
+  return DEFAULT_TARGET_CHARS
+}
+
+function resolveCustomTargetChars(raw: string): number {
+  const n = parseInt(raw, 10)
+  if (Number.isNaN(n)) return DEFAULT_TARGET_CHARS
+  return Math.max(MIN_TARGET_CHARS, Math.min(MAX_TARGET_CHARS, n))
+}
+
+function resolveTargetCharsForMode(
+  lengthMode: 'preset' | 'custom',
+  selectedPreset: string,
+  customTargetChars: string,
+): number {
+  if (lengthMode === 'custom') {
+    return resolveCustomTargetChars(customTargetChars)
+  }
+  return resolveTargetChars(selectedPreset)
 }
 
 function clampInt(raw: string, min: number, max: number): number | undefined {
@@ -61,11 +84,14 @@ export function WritingWorkspace() {
   const [chapter, setChapter] = useState<Chapter | null>(null)
   const [novelTitle, setNovelTitle] = useState('')
   const [instruction, setInstruction] = useState('')
+  const [lengthMode, setLengthMode] = useState<'preset' | 'custom'>('preset')
   const [selectedLength, setSelectedLength] = useState('3000')
+  const [customTargetChars, setCustomTargetChars] = useState(String(DEFAULT_TARGET_CHARS))
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [contextChapters, setContextChapters] = useState(String(DEFAULT_CONTEXT_CHAPTERS))
   const [numVersions, setNumVersions] = useState('1')
   const [temperature, setTemperature] = useState('0.8')
+  const [strictMode, setStrictMode] = useState(false)
   const [prefsLoaded, setPrefsLoaded] = useState(false)
 
   // Load user preferences as defaults (once)
@@ -81,10 +107,19 @@ export function WritingWorkspace() {
         const nextContextChapters = clampInt(String(p.context_chapters), MIN_CONTEXT_CHAPTERS, MAX_CONTEXT_CHAPTERS)
         setContextChapters(String(nextContextChapters ?? DEFAULT_CONTEXT_CHAPTERS))
       }
+      if (p.strict_mode != null) setStrictMode(Boolean(p.strict_mode))
+      if (p.length_mode === 'custom' || p.length_mode === 'preset') {
+        setLengthMode(p.length_mode)
+      }
       if (p.target_chars != null) {
         const tc = Number(p.target_chars)
         const match = LENGTH_OPTIONS.find(o => Number(o.value) === tc)
-        if (match) setSelectedLength(match.value)
+        if (match && p.length_mode !== 'custom') {
+          setSelectedLength(match.value)
+        } else if (Number.isFinite(tc)) {
+          setLengthMode('custom')
+          setCustomTargetChars(String(resolveCustomTargetChars(String(tc))))
+        }
       }
       setPrefsLoaded(true)
     })
@@ -94,14 +129,16 @@ export function WritingWorkspace() {
   const savePrefs = useCallback(() => {
     const prefs: Record<string, unknown> = {}
     const nv = parseInt(numVersions, 10)
-    if (!Number.isNaN(nv)) prefs.num_versions = Math.max(1, Math.min(2, nv))
+    if (!Number.isNaN(nv)) prefs.num_versions = Math.max(1, Math.min(MAX_NUM_VERSIONS, nv))
     const temp = parseFloat(temperature)
     if (!Number.isNaN(temp)) prefs.temperature = Math.max(0, Math.min(2, temp))
     prefs.context_chapters = clampInt(contextChapters, MIN_CONTEXT_CHAPTERS, MAX_CONTEXT_CHAPTERS) ?? DEFAULT_CONTEXT_CHAPTERS
-    const tc = resolveTargetChars(selectedLength)
+    prefs.length_mode = lengthMode
+    prefs.strict_mode = strictMode
+    const tc = resolveTargetCharsForMode(lengthMode, selectedLength, customTargetChars)
     prefs.target_chars = tc
     api.updatePreferences(prefs).catch(() => {})
-  }, [numVersions, temperature, contextChapters, selectedLength])
+  }, [numVersions, temperature, contextChapters, lengthMode, selectedLength, customTargetChars, strictMode])
 
   useEffect(() => {
     if (!nId || !cNum) return
@@ -125,12 +162,15 @@ export function WritingWorkspace() {
 
   const handleGenerate = () => {
     const parsedTemp = parseFloat(temperature)
+    const resolvedTargetChars = resolveTargetCharsForMode(lengthMode, selectedLength, customTargetChars)
     const streamParams = {
       prompt: instruction.trim() || undefined,
-      target_chars: resolveTargetChars(selectedLength),
+      length_mode: lengthMode,
+      target_chars: resolvedTargetChars,
       context_chapters: clampInt(contextChapters, MIN_CONTEXT_CHAPTERS, MAX_CONTEXT_CHAPTERS) ?? DEFAULT_CONTEXT_CHAPTERS,
-      num_versions: clampInt(numVersions, 1, 2) || undefined,
+      num_versions: clampInt(numVersions, 1, MAX_NUM_VERSIONS) || undefined,
       temperature: !Number.isNaN(parsedTemp) ? Math.max(0, Math.min(2, parsedTemp)) : undefined,
+      strict_mode: strictMode,
     }
     savePrefs()
     navigate(`/novel/${novelId}/chapter/${chapterNum}/results`, {
@@ -211,30 +251,74 @@ export function WritingWorkspace() {
             <label className="text-sm font-medium text-foreground">
               续写长度
             </label>
-            <div className="flex gap-2">
-              {LENGTH_OPTIONS.map(opt => {
-                const isDisabled = opt.disabled
-                const isSelected = !isDisabled && selectedLength === opt.value
-                return (
-                  <button
-                    key={opt.value}
-                    type="button"
-                    onClick={() => !isDisabled && setSelectedLength(opt.value)}
-                    disabled={isDisabled}
-                    className={cn(
-                      'flex-1 h-9 rounded-[10px] border text-sm font-mono transition-colors',
-                      isDisabled
-                        ? 'bg-muted/50 border-muted text-muted-foreground/40 cursor-not-allowed'
-                        : isSelected
-                        ? 'bg-[hsl(var(--accent)/0.12)] border-accent text-accent font-semibold'
-                        : 'bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-muted-foreground hover:bg-[var(--nw-glass-bg-hover)]'
-                    )}
-                  >
-                    {opt.label}
-                  </button>
-                )
-              })}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setLengthMode('preset')}
+                className={cn(
+                  'h-9 rounded-[10px] border text-sm font-medium transition-colors',
+                  lengthMode === 'preset'
+                    ? 'bg-[hsl(var(--accent)/0.12)] border-accent text-accent'
+                    : 'bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-muted-foreground hover:bg-[var(--nw-glass-bg-hover)]',
+                )}
+              >
+                预设档位
+              </button>
+              <button
+                type="button"
+                onClick={() => setLengthMode('custom')}
+                className={cn(
+                  'h-9 rounded-[10px] border text-sm font-medium transition-colors',
+                  lengthMode === 'custom'
+                    ? 'bg-[hsl(var(--accent)/0.12)] border-accent text-accent'
+                    : 'bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-muted-foreground hover:bg-[var(--nw-glass-bg-hover)]',
+                )}
+              >
+                自定义
+              </button>
             </div>
+            {lengthMode === 'custom' ? (
+              <div className="space-y-1">
+                <Input
+                  type="number"
+                  min={MIN_TARGET_CHARS}
+                  max={MAX_TARGET_CHARS}
+                  step={100}
+                  value={customTargetChars}
+                  onChange={e => setCustomTargetChars(e.target.value)}
+                  className="h-9 font-mono bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-foreground placeholder:text-muted-foreground/70 focus-visible:ring-accent focus-visible:ring-offset-0"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {MIN_TARGET_CHARS}–{MAX_TARGET_CHARS} 字
+                </p>
+              </div>
+            ) : null}
+            {lengthMode === 'preset' ? (
+              <div className="flex gap-2">
+                {LENGTH_OPTIONS.map(opt => {
+                  const isDisabled = opt.disabled
+                  const isSelected = !isDisabled && selectedLength === opt.value
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => !isDisabled && setSelectedLength(opt.value)}
+                      disabled={isDisabled}
+                      className={cn(
+                        'flex-1 h-9 rounded-[10px] border text-sm font-mono transition-colors',
+                        isDisabled
+                          ? 'bg-muted/50 border-muted text-muted-foreground/40 cursor-not-allowed'
+                          : isSelected
+                          ? 'bg-[hsl(var(--accent)/0.12)] border-accent text-accent font-semibold'
+                          : 'bg-[var(--nw-glass-bg)] border-[var(--nw-glass-border)] text-muted-foreground hover:bg-[var(--nw-glass-bg-hover)]'
+                      )}
+                    >
+                      {opt.label}
+                    </button>
+                  )
+                })}
+              </div>
+            ) : null}
           </div>
 
           {/* Advanced Toggle */}
@@ -261,8 +345,23 @@ export function WritingWorkspace() {
             <div className="overflow-hidden">
               <GlassCard className="rounded-xl p-4 flex flex-col gap-4">
                 <AdvancedRow label="上下文章节数" desc="1–5" value={contextChapters} onChange={setContextChapters} type="number" min={MIN_CONTEXT_CHAPTERS} max={MAX_CONTEXT_CHAPTERS} step={1} />
-                <AdvancedRow label="生成版本数" desc="1–2" value={numVersions} onChange={setNumVersions} type="number" min={1} max={2} step={1} />
+                <AdvancedRow label="生成版本数" desc="1–4" value={numVersions} onChange={setNumVersions} type="number" min={1} max={MAX_NUM_VERSIONS} step={1} />
                 <AdvancedRow label="创意温度" desc="0.0–2.0" value={temperature} onChange={setTemperature} type="number" min={0} max={2} step={0.1} />
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <span className="text-sm font-medium text-foreground">
+                      严格一致性
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      严格校验设定漂移（实验）
+                    </span>
+                  </div>
+                  <Checkbox
+                    checked={strictMode}
+                    onCheckedChange={setStrictMode}
+                    className="h-5 w-5 rounded border-[var(--nw-glass-border)] data-[state=checked]:bg-accent data-[state=checked]:text-accent-foreground"
+                  />
+                </div>
               </GlassCard>
             </div>
           </div>

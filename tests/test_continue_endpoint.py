@@ -11,6 +11,7 @@ Network calls are avoided by mocking ai_client.generate.
 import math
 import pytest
 import json
+from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import StaticPool, create_engine
@@ -256,6 +257,73 @@ class TestContinueEndpoint:
         assert "无缝衔接原文风格" in prompts[0]
         assert prompts[0].rstrip().endswith("请续写第3章：")
 
+    def test_custom_target_chars_supported_in_custom_mode(self, client, novel, monkeypatch):
+        c, _ = client
+
+        import app.core.generator as generator_mod
+
+        calls: list[int] = []
+
+        async def fake_generate(prompt: str, system_prompt: str = "", max_tokens: int = 0, **kwargs) -> str:
+            calls.append(max_tokens)
+            return "甲" * 2600 + "。"
+
+        monkeypatch.setattr(generator_mod.ai_client, "generate", fake_generate)
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={
+                "num_versions": 1,
+                "length_mode": "custom",
+                "target_chars": 2500,
+                "context_chapters": 2,
+            },
+        )
+        assert resp.status_code == 200
+        content = resp.json()["continuations"][0]["content"]
+        assert len(content) <= 2500
+
+        settings = generator_mod.get_settings()
+        expected_max_tokens = math.ceil(2500 * settings.continuation_chars_to_tokens_ratio)
+        expected_max_tokens = math.ceil(expected_max_tokens * (1 + settings.continuation_token_buffer_ratio))
+        expected_max_tokens = min(settings.max_continuation_tokens, max(100, expected_max_tokens))
+        assert calls[0] == expected_max_tokens
+
+    def test_custom_target_chars_without_length_mode_remains_compatible(self, client, novel, monkeypatch):
+        c, _ = client
+
+        import app.core.generator as generator_mod
+
+        async def fake_generate(prompt: str, system_prompt: str = "", max_tokens: int = 0, **kwargs) -> str:
+            return "甲" * 2400 + "。"
+
+        monkeypatch.setattr(generator_mod.ai_client, "generate", fake_generate)
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 1, "target_chars": 2200, "context_chapters": 2},
+        )
+        assert resp.status_code == 200
+        content = resp.json()["continuations"][0]["content"]
+        assert len(content) <= 2200
+
+    def test_preset_mode_rejects_non_preset_target_chars(self, client, novel):
+        c, _ = client
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 1, "length_mode": "preset", "target_chars": 2500},
+        )
+        assert resp.status_code == 422
+
+    def test_custom_mode_requires_target_chars(self, client, novel):
+        c, _ = client
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 1, "length_mode": "custom"},
+        )
+        assert resp.status_code == 422
 
     def test_user_prompt_is_part_of_relevance_signal(self, client, novel, world):
         c, captured = client
@@ -299,6 +367,117 @@ class TestContinueEndpoint:
 
         assert data["debug"]["context_chapters"] == 5
 
+    def test_num_versions_above_default_cap_rejected(self, client, novel):
+        c, _ = client
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 5, "context_chapters": 2},
+        )
+        assert resp.status_code == 422
+
+    def test_num_versions_respects_settings_cap(self, client, novel, monkeypatch):
+        c, _ = client
+
+        monkeypatch.setattr("app.schemas.get_settings", lambda: SimpleNamespace(max_continue_versions=2))
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 3, "context_chapters": 2},
+        )
+        assert resp.status_code == 422
+
+    def test_use_lorebook_true_injects_supplementary_lore_and_debug(self, client, novel, monkeypatch):
+        c, captured = client
+
+        import app.core.generator as generator_mod
+
+        class FakeLoreManager:
+            def get_injection_context(self, chapter_text: str, max_tokens: int):
+                return "秘史设定", ["a", "b"], 321
+
+        monkeypatch.setattr(generator_mod.cache_manager, "get_lore", lambda novel_id: FakeLoreManager())
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 1, "context_chapters": 2, "use_lorebook": True},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        prompt_used = str(captured.get("prompt") or "")
+        assert "<supplementary_lore>" in prompt_used
+        assert "秘史设定" in prompt_used
+        assert body["debug"]["lore_hits"] == 2
+        assert body["debug"]["lore_tokens_used"] == 321
+
+    def test_use_lorebook_false_skips_supplementary_lore_and_debug(self, client, novel, monkeypatch):
+        c, captured = client
+
+        import app.core.generator as generator_mod
+
+        class FakeLoreManager:
+            def get_injection_context(self, chapter_text: str, max_tokens: int):
+                return "秘史设定", ["a", "b"], 321
+
+        monkeypatch.setattr(generator_mod.cache_manager, "get_lore", lambda novel_id: FakeLoreManager())
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 1, "context_chapters": 2, "use_lorebook": False},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        prompt_used = str(captured.get("prompt") or "")
+        assert "<supplementary_lore>" not in prompt_used
+        assert body["debug"]["lore_hits"] == 0
+        assert body["debug"]["lore_tokens_used"] == 0
+
+    def test_strict_mode_retries_once_and_returns_repaired_continuation(self, client, db, novel, monkeypatch):
+        c, _ = client
+
+        import app.core.generator as generator_mod
+
+        call_count = {"n": 0}
+
+        async def fake_generate(prompt: str, system_prompt: str = "", max_tokens: int = 0, **kwargs) -> str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return "他名为夜渊，站在殿前。"
+            return "他立在殿前，沉默良久。"
+
+        monkeypatch.setattr(generator_mod.ai_client, "generate", fake_generate)
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 1, "context_chapters": 2, "strict_mode": True},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["continuations"][0]["content"] == "他立在殿前，沉默良久。"
+        assert call_count["n"] == 2
+        assert db.query(Continuation).filter(Continuation.novel_id == novel.id).count() == 1
+
+    def test_strict_mode_returns_422_and_rolls_back_persisted_outputs_when_retry_still_fails(
+        self, client, db, novel, monkeypatch
+    ):
+        c, _ = client
+
+        import app.core.generator as generator_mod
+
+        async def fake_generate(prompt: str, system_prompt: str = "", max_tokens: int = 0, **kwargs) -> str:
+            return "他名为夜渊，站在殿前。"
+
+        monkeypatch.setattr(generator_mod.ai_client, "generate", fake_generate)
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue",
+            json={"num_versions": 1, "context_chapters": 2, "strict_mode": True},
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "postcheck_strict_failed"
+        assert "夜渊" in detail["terms"]
+        assert db.query(Continuation).filter(Continuation.novel_id == novel.id).count() == 0
+
 
 class TestContinueStreamEndpoint:
     def test_stream_yields_ndjson_events_and_includes_variant_content(self, client, novel):
@@ -341,6 +520,72 @@ class TestContinueStreamEndpoint:
         assert captured.get("kwargs", {}).get("base_url") == "https://user.example.com/v1"
         assert captured.get("kwargs", {}).get("api_key") == "user-key"
         assert captured.get("kwargs", {}).get("model") == "user-model"
+
+    def test_stream_supports_four_variants(self, client, novel):
+        c, _ = client
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue/stream",
+            json={"num_versions": 4, "context_chapters": 2},
+        )
+        assert resp.status_code == 200
+
+        events = [json.loads(ln) for ln in resp.text.splitlines() if ln.strip()]
+        assert events[0]["type"] == "start"
+        assert events[0]["total_variants"] == 4
+        done_events = [e for e in events if e["type"] == "variant_done"]
+        assert [e["variant"] for e in done_events] == [0, 1, 2, 3]
+
+    def test_stream_strict_mode_emits_postcheck_strict_failed_error_event(self, client, db, novel, monkeypatch):
+        c, _ = client
+
+        import app.core.generator as generator_mod
+
+        async def fake_generate(prompt: str, system_prompt: str = "", max_tokens: int = 0, **kwargs) -> str:
+            return "他名为夜渊，站在殿前。"
+
+        monkeypatch.setattr(generator_mod.ai_client, "generate", fake_generate)
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue/stream",
+            json={"num_versions": 1, "context_chapters": 2, "strict_mode": True},
+        )
+        assert resp.status_code == 200
+        events = [json.loads(ln) for ln in resp.text.splitlines() if ln.strip()]
+        assert events[0]["type"] == "start"
+        err = next(e for e in events if e["type"] == "error")
+        assert err["code"] == "postcheck_strict_failed"
+        assert db.query(Continuation).filter(Continuation.novel_id == novel.id).count() == 0
+
+    def test_stream_strict_mode_retries_once_and_returns_variant_done_without_tokens(
+        self, client, novel, monkeypatch
+    ):
+        c, _ = client
+
+        import app.core.generator as generator_mod
+
+        calls = {"n": 0}
+
+        async def fake_generate(prompt: str, system_prompt: str = "", max_tokens: int = 0, **kwargs) -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "他名为夜渊，站在殿前。"
+            return "他立在殿前，沉默良久。"
+
+        monkeypatch.setattr(generator_mod.ai_client, "generate", fake_generate)
+
+        resp = c.post(
+            f"/api/novels/{novel.id}/continue/stream",
+            json={"num_versions": 1, "context_chapters": 2, "strict_mode": True},
+        )
+        assert resp.status_code == 200
+
+        events = [json.loads(ln) for ln in resp.text.splitlines() if ln.strip()]
+        assert events[0]["type"] == "start"
+        assert not any(e["type"] == "token" for e in events)
+        variant_done = next(e for e in events if e["type"] == "variant_done")
+        assert variant_done["content"] == "他立在殿前，沉默良久。"
+        assert calls["n"] == 2
 
     def test_get_continuations_preserves_requested_order(self, client, novel):
         c, _ = client
@@ -426,3 +671,29 @@ class TestTemperaturePassthrough:
             json={"num_versions": 1, "temperature": 2.1},
         )
         assert resp.status_code == 422
+
+
+class TestLorebookConfigResolution:
+    def test_resolve_use_lorebook_honors_request_override(self, monkeypatch):
+        from app.api import novels
+        from app.schemas import ContinueRequest
+
+        monkeypatch.setattr(
+            novels,
+            "get_settings",
+            lambda: SimpleNamespace(continuation_use_lorebook_default=False),
+        )
+
+        assert novels._resolve_use_lorebook(ContinueRequest(num_versions=1, use_lorebook=True)) is True
+        assert novels._resolve_use_lorebook(ContinueRequest(num_versions=1, use_lorebook=False)) is False
+
+    def test_resolve_use_lorebook_follows_server_default_when_request_not_set(self, monkeypatch):
+        from app.api import novels
+        from app.schemas import ContinueRequest
+
+        monkeypatch.setattr(
+            novels,
+            "get_settings",
+            lambda: SimpleNamespace(continuation_use_lorebook_default=True),
+        )
+        assert novels._resolve_use_lorebook(ContinueRequest(num_versions=1)) is True

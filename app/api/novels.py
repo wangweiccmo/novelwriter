@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Sequence
 import json
 import logging
 import re
@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 UPLOAD_CONSENT_VERSION = "2026-03-06"
 
 _SAFE_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_STRICT_POSTCHECK_CODES = {
+    "unknown_term_named",
+    "unknown_address_token",
+}
 
 
 def _safe_delete_where(
@@ -482,6 +486,233 @@ class _ContinuationContext:
     debug_summary: ContinueDebugSummary
     writer_ctx: dict[str, Any]
     effective_context_chapters: int
+
+
+def _resolve_use_lorebook(req: ContinueRequest) -> bool:
+    if req.use_lorebook is not None:
+        return bool(req.use_lorebook)
+    return bool(get_settings().continuation_use_lorebook_default)
+
+
+def _continue_log_extra(
+    *,
+    request_id: str | None,
+    novel_id: int,
+    user_id: int,
+    variant: int | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "novel_id": int(novel_id),
+        "user_id": int(user_id),
+        "variant": variant,
+        "attempt": attempt,
+    }
+
+
+def _strict_failure_terms_from_detail(detail: Any) -> list[str]:
+    if not isinstance(detail, dict):
+        return []
+    raw_terms = detail.get("terms")
+    if not isinstance(raw_terms, list):
+        return []
+    terms: list[str] = []
+    for raw in raw_terms:
+        term = str(raw or "").strip()
+        if term:
+            terms.append(term)
+    return terms
+
+
+def _record_continue_event(
+    db: Session,
+    *,
+    user_id: int,
+    novel_id: int,
+    event: str,
+    request_id: str | None,
+    stream: bool,
+    strict_mode: bool,
+    use_lorebook: bool,
+    variant: int | None = None,
+    attempt: int | None = None,
+    extra_meta: dict[str, Any] | None = None,
+) -> None:
+    meta: dict[str, Any] = {
+        "request_id": request_id,
+        "stream": bool(stream),
+        "strict_mode": bool(strict_mode),
+        "use_lorebook": bool(use_lorebook),
+        "variant": variant,
+        "attempt": attempt,
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+    record_event(db, user_id, event, novel_id=novel_id, meta=meta)
+
+
+def _extract_lore_debug_fields(debug_payload: dict[str, Any]) -> dict[str, int]:
+    def _safe_int(value: Any) -> int:
+        try:
+            return max(0, int(value))
+        except Exception:
+            return 0
+
+    return {
+        "lore_hits": _safe_int(debug_payload.get("lore_hits")),
+        "lore_tokens_used": _safe_int(debug_payload.get("lore_tokens_used")),
+    }
+
+
+def _has_effective_lore_debug(debug_update: dict[str, int]) -> bool:
+    return int(debug_update.get("lore_hits", 0)) > 0 or int(debug_update.get("lore_tokens_used", 0)) > 0
+
+
+def _strict_postcheck_warnings(postcheck_warnings: Sequence[Any]) -> list[Any]:
+    out: list[Any] = []
+    for warning in postcheck_warnings or []:
+        code = str(getattr(warning, "code", "") or "")
+        if code in _STRICT_POSTCHECK_CODES:
+            out.append(warning)
+    return out
+
+
+def _strict_warning_terms(postcheck_warnings: Sequence[Any]) -> list[str]:
+    terms = {
+        str(getattr(warning, "term", "") or "").strip()
+        for warning in postcheck_warnings or []
+        if str(getattr(warning, "term", "") or "").strip()
+    }
+    return sorted(terms)
+
+
+def _build_strict_repair_prompt(user_prompt: str | None, postcheck_warnings: Sequence[Any]) -> str:
+    terms = _strict_warning_terms(postcheck_warnings)
+    terms_text = "、".join(terms[:12]) if terms else "（未识别具体术语）"
+    strict_instruction = (
+        "【严格一致性修正】上一版触发设定漂移风险，请重写本章正文：\n"
+        f"- 风险词：{terms_text}\n"
+        "- 禁止新增未在世界知识、最近章节中出现的人名、地名、组织名、称谓。\n"
+        "- 保留原本剧情意图，但将风险词替换为已有设定中的表达。\n"
+        "- 只输出正文，不输出解释。"
+    )
+    if user_prompt and user_prompt.strip():
+        return f"{user_prompt.strip()}\n\n{strict_instruction}"
+    return strict_instruction
+
+
+def _delete_continuations_by_id(db: Session, continuations: Sequence[Any]) -> None:
+    ids: list[int] = []
+    for cont in continuations or []:
+        raw_id = getattr(cont, "id", None)
+        if raw_id is None:
+            continue
+        try:
+            ids.append(int(raw_id))
+        except Exception:
+            continue
+    if not ids:
+        return
+    db.query(Continuation).filter(Continuation.id.in_(ids)).delete(synchronize_session=False)
+    db.commit()
+
+
+async def _generate_continuations_with_postcheck(
+    *,
+    db: Session,
+    novel_id: int,
+    req: ContinueRequest,
+    ctx: _ContinuationContext,
+    llm_config: dict | None,
+    user_id: int,
+    use_lorebook: bool,
+    request_id: str | None = None,
+) -> tuple[list[Continuation], list[Any], bool, dict[str, Any]]:
+    """Generate continuations and apply optional strict postcheck retry logic."""
+    debug_payload = ctx.debug_summary.model_dump()
+
+    async def _generate_once(
+        prompt_override: str | None = None,
+        *,
+        attempt: int,
+    ) -> list[Continuation]:
+        return await continue_novel(
+            db=db,
+            novel_id=novel_id,
+            num_versions=req.num_versions,
+            prompt=prompt_override if prompt_override is not None else req.prompt,
+            max_tokens=req.max_tokens,
+            target_chars=req.target_chars,
+            context_chapters=ctx.effective_context_chapters,
+            world_context=ctx.world_context,
+            narrative_constraints=ctx.narrative_constraints,
+            world_debug_summary=debug_payload,
+            use_lorebook=use_lorebook,
+            llm_config=llm_config,
+            temperature=req.temperature,
+            user_id=user_id,
+            request_id=request_id,
+            attempt=attempt,
+        )
+
+    continuations = await _generate_once(attempt=1)
+    postcheck_warnings = postcheck_continuation(
+        writer_ctx=ctx.writer_ctx,
+        recent_text=ctx.recent_text,
+        # Keep postcheck baseline stable even on strict repair retry.
+        user_prompt=req.prompt,
+        continuations=continuations,
+    )
+
+    strict_retry_applied = False
+    if req.strict_mode:
+        strict_warnings = _strict_postcheck_warnings(postcheck_warnings)
+        if strict_warnings:
+            strict_retry_applied = True
+            _delete_continuations_by_id(db, continuations)
+
+            logger.info(
+                "strict postcheck retry triggered",
+                extra=_continue_log_extra(
+                    request_id=request_id,
+                    novel_id=novel_id,
+                    user_id=user_id,
+                    variant=None,
+                    attempt=2,
+                ),
+            )
+            repaired_prompt = _build_strict_repair_prompt(req.prompt, strict_warnings)
+            continuations = await _generate_once(repaired_prompt, attempt=2)
+            postcheck_warnings = postcheck_continuation(
+                writer_ctx=ctx.writer_ctx,
+                recent_text=ctx.recent_text,
+                user_prompt=req.prompt,
+                continuations=continuations,
+            )
+            strict_warnings = _strict_postcheck_warnings(postcheck_warnings)
+            if strict_warnings:
+                _delete_continuations_by_id(db, continuations)
+                logger.warning(
+                    "strict postcheck retry failed",
+                    extra=_continue_log_extra(
+                        request_id=request_id,
+                        novel_id=novel_id,
+                        user_id=user_id,
+                        variant=None,
+                        attempt=2,
+                    ),
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "postcheck_strict_failed",
+                        "message": "Strict mode consistency check failed after retry",
+                        "terms": _strict_warning_terms(strict_warnings),
+                    },
+                )
+
+    return continuations, list(postcheck_warnings or []), strict_retry_applied, debug_payload
 
 
 def _prepare_continuation_context(
@@ -910,6 +1141,7 @@ def delete_chapter(
 async def continue_novel_endpoint(
     novel_id: int,
     req: ContinueRequest,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user_or_default),
     llm_config: dict | None = Depends(get_llm_config),
@@ -917,54 +1149,122 @@ async def continue_novel_endpoint(
 ):
     """Continue a novel using WorldModel visibility-driven context injection."""
     current_user = _quota_user
+    request_id = getattr(getattr(request, "state", None), "request_id", None)
+    use_lorebook = _resolve_use_lorebook(req)
     ctx = await run_in_threadpool(
         _prepare_continuation_context, db, novel_id, req, current_user,
     )
+    if use_lorebook:
+        _record_continue_event(
+            db,
+            user_id=current_user.id,
+            novel_id=novel_id,
+            event="continue_lore_enabled",
+            request_id=request_id,
+            stream=False,
+            strict_mode=bool(req.strict_mode),
+            use_lorebook=True,
+            variant=None,
+            attempt=1,
+        )
 
     await acquire_llm_slot()
     quota = QuotaScope(db, current_user.id, count=int(req.num_versions or 1))
     try:
         quota.reserve()
-        continuations = await continue_novel(
+        continuations, postcheck_warnings, strict_retry_applied, debug_payload = await _generate_continuations_with_postcheck(
             db=db,
             novel_id=novel_id,
-            num_versions=req.num_versions,
-            prompt=req.prompt,
-            max_tokens=req.max_tokens,
-            target_chars=req.target_chars,
-            context_chapters=ctx.effective_context_chapters,
-            world_context=ctx.world_context,
-            narrative_constraints=ctx.narrative_constraints,
-            world_debug_summary=ctx.debug_summary.model_dump(),
-            use_lorebook=False,
+            req=req,
+            ctx=ctx,
             llm_config=llm_config,
-            temperature=req.temperature,
             user_id=current_user.id,
+            use_lorebook=use_lorebook,
+            request_id=request_id,
         )
         quota.charge(len(continuations or []))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        if exc.status_code == 422 and detail.get("code") == "postcheck_strict_failed":
+            _record_continue_event(
+                db,
+                user_id=current_user.id,
+                novel_id=novel_id,
+                event="continue_strict_fail",
+                request_id=request_id,
+                stream=False,
+                strict_mode=bool(req.strict_mode),
+                use_lorebook=use_lorebook,
+                variant=None,
+                attempt=2,
+                extra_meta={"terms": _strict_failure_terms_from_detail(detail)},
+            )
         raise
     except Exception:
-        logger.exception("continue_novel failed for novel %s", novel_id)
+        logger.exception(
+            "continue_novel failed",
+            extra=_continue_log_extra(
+                request_id=request_id,
+                novel_id=novel_id,
+                user_id=current_user.id,
+                variant=None,
+                attempt=1,
+            ),
+        )
         raise HTTPException(status_code=500, detail="Continuation generation failed")
     finally:
         quota.finalize()
         release_llm_slot()
 
-    record_event(db, current_user.id, "generation", novel_id=novel_id, meta={"variants": len(continuations)})
-
-    postcheck_warnings = postcheck_continuation(
-        writer_ctx=ctx.writer_ctx,
-        recent_text=ctx.recent_text,
-        user_prompt=req.prompt,
-        continuations=continuations,
+    _record_continue_event(
+        db,
+        user_id=current_user.id,
+        novel_id=novel_id,
+        event="generation",
+        request_id=request_id,
+        stream=False,
+        strict_mode=bool(req.strict_mode),
+        use_lorebook=use_lorebook,
+        variant=None,
+        attempt=1,
+        extra_meta={"variants": len(continuations)},
     )
-    if postcheck_warnings:
-        ctx.debug_summary = ctx.debug_summary.model_copy(
-            update={"postcheck_warnings": postcheck_warnings}
+
+    debug_update = _extract_lore_debug_fields(debug_payload)
+    should_update_debug = _has_effective_lore_debug(debug_update)
+    if strict_retry_applied:
+        logger.info(
+            "strict-mode continuation retry succeeded",
+            extra=_continue_log_extra(
+                request_id=request_id,
+                novel_id=novel_id,
+                user_id=current_user.id,
+                variant=None,
+                attempt=2,
+            ),
         )
+        _record_continue_event(
+            db,
+            user_id=current_user.id,
+            novel_id=novel_id,
+            event="continue_strict_retry",
+            request_id=request_id,
+            stream=False,
+            strict_mode=True,
+            use_lorebook=use_lorebook,
+            variant=None,
+            attempt=2,
+            extra_meta={"warning_count": len(postcheck_warnings or [])},
+        )
+        debug_update["strict_retry_applied"] = True
+        should_update_debug = True
+    if postcheck_warnings:
+        debug_update["postcheck_warnings"] = postcheck_warnings
+        should_update_debug = True
+    if should_update_debug:
+        ctx.debug_summary = ctx.debug_summary.model_copy(update=debug_update)
 
     return ContinueResponse(continuations=continuations, debug=ctx.debug_summary)
 
@@ -981,6 +1281,7 @@ async def continue_novel_stream_endpoint(
 ):
     """Stream continuation generation via NDJSON."""
     current_user = _quota_user
+    use_lorebook = _resolve_use_lorebook(req)
     settings = get_settings()
     if settings.deploy_mode != "selfhost" and current_user.generation_quota < req.num_versions:
         raise HTTPException(
@@ -1005,13 +1306,149 @@ async def continue_novel_stream_endpoint(
         raise
 
     request_id = getattr(request.state, "request_id", None)
+    if use_lorebook:
+        _record_continue_event(
+            db,
+            user_id=current_user.id,
+            novel_id=novel_id,
+            event="continue_lore_enabled",
+            request_id=request_id,
+            stream=True,
+            strict_mode=bool(req.strict_mode),
+            use_lorebook=True,
+            variant=None,
+            attempt=1,
+        )
 
     async def event_generator():
         try:
             from types import SimpleNamespace
 
+            if req.strict_mode:
+                start_event: dict[str, Any] = {
+                    "type": "start",
+                    "variant": 0,
+                    "total_variants": int(req.num_versions or 1),
+                    "debug": ctx.debug_summary.model_dump(),
+                }
+                if request_id:
+                    start_event["request_id"] = request_id
+                yield json.dumps(start_event, ensure_ascii=False) + "\n"
+
+                try:
+                    continuations, postcheck_warnings, strict_retry_applied, debug_payload = await _generate_continuations_with_postcheck(
+                        db=db,
+                        novel_id=novel_id,
+                        req=req,
+                        ctx=ctx,
+                        llm_config=llm_config,
+                        user_id=current_user.id,
+                        use_lorebook=use_lorebook,
+                        request_id=request_id,
+                    )
+                except HTTPException as exc:
+                    detail = exc.detail if isinstance(exc.detail, dict) else {}
+                    if exc.status_code == 422 and detail.get("code") == "postcheck_strict_failed":
+                        event = {
+                            "type": "error",
+                            "code": "postcheck_strict_failed",
+                            "message": "严格一致性校验未通过，请调整提示词后重试",
+                        }
+                        if request_id:
+                            event["request_id"] = request_id
+                        _record_continue_event(
+                            db,
+                            user_id=current_user.id,
+                            novel_id=novel_id,
+                            event="continue_strict_fail",
+                            request_id=request_id,
+                            stream=True,
+                            strict_mode=True,
+                            use_lorebook=use_lorebook,
+                            variant=None,
+                            attempt=2,
+                            extra_meta={"terms": _strict_failure_terms_from_detail(detail)},
+                        )
+                        yield json.dumps(event, ensure_ascii=False) + "\n"
+                        return
+                    raise
+                except Exception:
+                    logger.exception(
+                        "strict continue_novel_stream failed",
+                        extra=_continue_log_extra(
+                            request_id=request_id,
+                            novel_id=novel_id,
+                            user_id=current_user.id,
+                            variant=None,
+                            attempt=1,
+                        ),
+                    )
+                    event = {
+                        "type": "error",
+                        "code": "llm_generate_failed",
+                        "message": "续写生成失败，请重试",
+                    }
+                    if request_id:
+                        event["request_id"] = request_id
+                    yield json.dumps(event, ensure_ascii=False) + "\n"
+                    return
+
+                continuation_ids: list[int] = []
+                for variant_idx, continuation in enumerate(continuations):
+                    quota.charge(1)
+                    continuation_id = int(continuation.id)
+                    continuation_ids.append(continuation_id)
+                    yield json.dumps(
+                        {
+                            "type": "variant_done",
+                            "variant": variant_idx,
+                            "continuation_id": continuation_id,
+                            "content": continuation.content,
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+
+                done_event: dict[str, Any] = {
+                    "type": "done",
+                    "continuation_ids": continuation_ids,
+                }
+                lore_debug_update = _extract_lore_debug_fields(debug_payload)
+                if postcheck_warnings:
+                    debug_with_warnings = ctx.debug_summary.model_copy(
+                        update={**lore_debug_update, "postcheck_warnings": postcheck_warnings}
+                    )
+                    debug_payload = debug_with_warnings.model_dump()
+                    if strict_retry_applied:
+                        debug_payload["strict_retry_applied"] = True
+                    done_event["debug"] = debug_payload
+                elif strict_retry_applied:
+                    debug_payload = ctx.debug_summary.model_copy(update=lore_debug_update).model_dump()
+                    debug_payload["strict_retry_applied"] = True
+                    done_event["debug"] = debug_payload
+                elif _has_effective_lore_debug(lore_debug_update):
+                    done_event["debug"] = ctx.debug_summary.model_copy(update=lore_debug_update).model_dump()
+
+                if strict_retry_applied:
+                    _record_continue_event(
+                        db,
+                        user_id=current_user.id,
+                        novel_id=novel_id,
+                        event="continue_strict_retry",
+                        request_id=request_id,
+                        stream=True,
+                        strict_mode=True,
+                        use_lorebook=use_lorebook,
+                        variant=None,
+                        attempt=2,
+                        extra_meta={"warning_count": len(postcheck_warnings or [])},
+                    )
+
+                yield json.dumps(done_event, ensure_ascii=False) + "\n"
+                return
+
             contents_by_variant: dict[int, str] = {}
             total_variants: int | None = None
+            debug_payload = ctx.debug_summary.model_dump()
 
             async for event in continue_novel_stream(
                 db=db,
@@ -1023,12 +1460,13 @@ async def continue_novel_stream_endpoint(
                 context_chapters=ctx.effective_context_chapters,
                 world_context=ctx.world_context,
                 narrative_constraints=ctx.narrative_constraints,
-                world_debug_summary=ctx.debug_summary.model_dump(),
-                use_lorebook=False,
+                world_debug_summary=debug_payload,
+                use_lorebook=use_lorebook,
                 llm_config=llm_config,
                 request_id=request_id,
                 temperature=req.temperature,
                 user_id=current_user.id,
+                attempt=1,
             ):
                 if event.get("type") == "start":
                     try:
@@ -1058,22 +1496,47 @@ async def continue_novel_stream_endpoint(
                             user_prompt=req.prompt,
                             continuations=conts,
                         )
+                        lore_debug_update = _extract_lore_debug_fields(debug_payload)
                         if postcheck_warnings:
                             debug_with_warnings = ctx.debug_summary.model_copy(
-                                update={"postcheck_warnings": postcheck_warnings}
+                                update={
+                                    **lore_debug_update,
+                                    "postcheck_warnings": postcheck_warnings,
+                                }
                             )
                             event["debug"] = debug_with_warnings.model_dump()
+                        elif _has_effective_lore_debug(lore_debug_update):
+                            event["debug"] = ctx.debug_summary.model_copy(
+                                update=lore_debug_update
+                            ).model_dump()
                     except Exception:
                         logger.exception(
-                            "postcheck_continuation failed for stream (request_id=%s, novel_id=%s)",
-                            request_id,
-                            novel_id,
+                            "postcheck_continuation failed for stream",
+                            extra=_continue_log_extra(
+                                request_id=request_id,
+                                novel_id=novel_id,
+                                user_id=current_user.id,
+                                variant=None,
+                                attempt=1,
+                            ),
                         )
                 yield json.dumps(event, ensure_ascii=False) + "\n"
         finally:
             quota.finalize()
             if quota.charged > 0:
-                record_event(db, current_user.id, "generation", novel_id=novel_id, meta={"variants": quota.charged, "stream": True})
+                _record_continue_event(
+                    db,
+                    user_id=current_user.id,
+                    novel_id=novel_id,
+                    event="generation",
+                    request_id=request_id,
+                    stream=True,
+                    strict_mode=bool(req.strict_mode),
+                    use_lorebook=use_lorebook,
+                    variant=None,
+                    attempt=1,
+                    extra_meta={"variants": quota.charged},
+                )
             release_llm_slot()
 
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")

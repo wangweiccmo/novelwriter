@@ -4,7 +4,13 @@ from typing import ClassVar, Optional, List, Literal, Any
 from datetime import datetime
 from enum import Enum
 
-from app.config import MAX_CONTEXT_CHAPTERS
+from app.config import (
+    MAX_CONTEXT_CHAPTERS,
+    MAX_CONTINUATION_TARGET_CHARS,
+    MAX_CONTINUATION_VERSIONS,
+    MIN_CONTINUATION_TARGET_CHARS,
+    get_settings,
+)
 from app.world_visibility import WorldVisibility, normalize_visibility
 
 WorldOrigin = Literal["manual", "bootstrap", "worldpack", "worldgen"]
@@ -87,10 +93,19 @@ class ContinuationResponse(BaseModel):
 class ContinueRequest(BaseModel):
     ALLOWED_TARGET_CHARS: ClassVar[set[int]] = {2000, 3000, 4000}
 
-    num_versions: int = Field(default=1, ge=1, le=2)
+    num_versions: int = Field(default=1, ge=1, le=MAX_CONTINUATION_VERSIONS)
+    length_mode: Literal["preset", "custom"] | None = Field(
+        default=None,
+        description="续写长度模式。preset=预设字数档位，custom=自定义字数。",
+    )
     prompt: str | None = Field(default=None, max_length=2000, description="用户续写指令")
     max_tokens: int | None = Field(default=None, ge=100, le=16000, description="生成的最大 token 数")
-    target_chars: int | None = Field(default=None, description="目标续写字数（2000/3000/4000）")
+    target_chars: int | None = Field(
+        default=None,
+        ge=MIN_CONTINUATION_TARGET_CHARS,
+        le=MAX_CONTINUATION_TARGET_CHARS,
+        description=f"目标续写字数（{MIN_CONTINUATION_TARGET_CHARS}-{MAX_CONTINUATION_TARGET_CHARS}）",
+    )
     context_chapters: int | None = Field(
         default=None,
         ge=1,
@@ -102,11 +117,35 @@ class ContinueRequest(BaseModel):
         le=2.0,
         description="LLM 采样温度（0.0-2.0），默认 0.8",
     )
+    strict_mode: bool = Field(default=False, description="是否启用严格一致性模式（P0: 参数预留）")
+    use_lorebook: bool | None = Field(
+        default=None,
+        description="是否启用 Lorebook 注入；不传则跟随服务端默认配置。",
+    )
 
     @model_validator(mode="after")
     def _validate_target_chars(self):
-        if self.target_chars is not None and self.target_chars not in self.ALLOWED_TARGET_CHARS:
-            raise ValueError(f"target_chars must be one of {sorted(self.ALLOWED_TARGET_CHARS)}")
+        settings = get_settings()
+        max_versions = max(
+            1,
+            min(MAX_CONTINUATION_VERSIONS, int(getattr(settings, "max_continue_versions", MAX_CONTINUATION_VERSIONS))),
+        )
+        if self.num_versions > max_versions:
+            raise ValueError(f"num_versions must be <= {max_versions}")
+
+        if self.length_mode is None:
+            if self.target_chars is not None and self.target_chars not in self.ALLOWED_TARGET_CHARS:
+                self.length_mode = "custom"
+            else:
+                self.length_mode = "preset"
+
+        if self.length_mode == "preset":
+            if self.target_chars is not None and self.target_chars not in self.ALLOWED_TARGET_CHARS:
+                raise ValueError(f"target_chars must be one of {sorted(self.ALLOWED_TARGET_CHARS)} in preset mode")
+        elif self.length_mode == "custom":
+            if self.target_chars is None:
+                raise ValueError("target_chars is required when length_mode=custom")
+
         if self.context_chapters is not None and self.context_chapters > MAX_CONTEXT_CHAPTERS:
             self.context_chapters = MAX_CONTEXT_CHAPTERS
         return self
@@ -145,6 +184,8 @@ class ContinueDebugSummary(BaseModel):
     injected_relationships: List[str] = Field(default_factory=list)
     relevant_entity_ids: List[int] = Field(default_factory=list)
     ambiguous_keywords_disabled: List[str] = Field(default_factory=list)
+    lore_hits: int = 0
+    lore_tokens_used: int = 0
     postcheck_warnings: List[PostcheckWarning] = Field(default_factory=list)
 
 

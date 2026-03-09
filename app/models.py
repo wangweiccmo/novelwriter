@@ -309,6 +309,7 @@ class BootstrapJob(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     novel_id = Column(Integer, ForeignKey("novels.id"), nullable=False, unique=True)
+    quota_reservation_id = Column(Integer, ForeignKey("quota_reservations.id"), nullable=True)
     mode = Column(String(20), nullable=False, default="index_refresh")
     draft_policy = Column(String(50), nullable=True, default=None)
     initialized = Column(Boolean, nullable=False, default=False)

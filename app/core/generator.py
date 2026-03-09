@@ -9,7 +9,7 @@ This module provides:
 2. Multi-model routing support
 """
 
-from typing import AsyncGenerator, List
+from typing import Any, AsyncGenerator, List
 import asyncio
 import math
 import re
@@ -28,6 +28,23 @@ logger = logging.getLogger(__name__)
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def _continue_log_extra(
+    *,
+    request_id: str | None,
+    novel_id: int,
+    user_id: int | None,
+    variant: int | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "novel_id": int(novel_id),
+        "user_id": int(user_id) if isinstance(user_id, int) else None,
+        "variant": variant,
+        "attempt": attempt,
+    }
 
 
 def _sanitize_continuation_content(text: str) -> str:
@@ -190,6 +207,9 @@ async def _build_continuation_prompt(
     world_context: str | None = None,
     narrative_constraints: str | None = None,
     world_debug_summary: dict | None = None,
+    request_id: str | None = None,
+    user_id: int | None = None,
+    attempt: int | None = None,
 ) -> tuple[str, int, dict]:
     """Build the continuation prompt and return (prompt, effective_max_tokens, build_info)."""
     settings = get_settings()
@@ -269,11 +289,30 @@ async def _build_continuation_prompt(
                 len(systems),
                 len(entities),
                 len(rels),
+                extra=_continue_log_extra(
+                    request_id=request_id,
+                    novel_id=novel_id,
+                    user_id=user_id,
+                    variant=None,
+                    attempt=attempt,
+                ),
             )
         except Exception:
-            logger.info("Injecting WorldModel context for novel %s", novel_id)
+            logger.info(
+                "Injecting WorldModel context for novel %s",
+                novel_id,
+                extra=_continue_log_extra(
+                    request_id=request_id,
+                    novel_id=novel_id,
+                    user_id=user_id,
+                    variant=None,
+                    attempt=attempt,
+                ),
+            )
 
     lorebook_context = ""
+    lore_hits = 0
+    lore_tokens_used = 0
     if use_lorebook:
         try:
             lore_manager = cache_manager.get_lore(novel_id)
@@ -285,14 +324,36 @@ async def _build_continuation_prompt(
                 recent_content,
                 max_tokens=settings.lore_max_total_tokens,
             )
+            lore_hits = len(matched_entries or [])
+            lore_tokens_used = int(total_tokens or 0)
             if context:
                 lorebook_context = f"\n<supplementary_lore>\n{context}\n</supplementary_lore>"
                 logger.info(
                     f"Injecting Lorebook context for novel {novel_id}: "
-                    f"{len(matched_entries)} entries, {total_tokens} tokens"
+                    f"{len(matched_entries)} entries, {total_tokens} tokens",
+                    extra=_continue_log_extra(
+                        request_id=request_id,
+                        novel_id=novel_id,
+                        user_id=user_id,
+                        variant=None,
+                        attempt=attempt,
+                    ),
                 )
         except Exception as e:
-            logger.warning(f"Failed to get Lorebook context for novel {novel_id}: {e}")
+            logger.warning(
+                f"Failed to get Lorebook context for novel {novel_id}: {e}",
+                extra=_continue_log_extra(
+                    request_id=request_id,
+                    novel_id=novel_id,
+                    user_id=user_id,
+                    variant=None,
+                    attempt=attempt,
+                ),
+            )
+
+    if isinstance(world_debug_summary, dict):
+        world_debug_summary["lore_hits"] = int(max(0, lore_hits))
+        world_debug_summary["lore_tokens_used"] = int(max(0, lore_tokens_used))
 
     combined_context = ""
     if world_context_section:
@@ -303,7 +364,16 @@ async def _build_continuation_prompt(
     user_instruction = ""
     if prompt and prompt.strip():
         user_instruction = f"\n<user_instruction>\n{prompt.strip()}\n</user_instruction>\n"
-        logger.info(f"User instruction provided for novel {novel_id}: {prompt[:50]}...")
+        logger.info(
+            f"User instruction provided for novel {novel_id}: {prompt[:50]}...",
+            extra=_continue_log_extra(
+                request_id=request_id,
+                novel_id=novel_id,
+                user_id=user_id,
+                variant=None,
+                attempt=attempt,
+            ),
+        )
 
     constraints_section = (narrative_constraints or "").strip()
 
@@ -351,6 +421,8 @@ async def continue_novel(
     llm_config: dict | None = None,
     temperature: float | None = None,
     user_id: int | None = None,
+    request_id: str | None = None,
+    attempt: int = 1,
 ) -> List[Continuation]:
     """
     Generate continuation for a novel.
@@ -383,6 +455,9 @@ async def continue_novel(
         world_context=world_context,
         narrative_constraints=narrative_constraints,
         world_debug_summary=world_debug_summary,
+        request_id=request_id,
+        user_id=user_id,
+        attempt=attempt,
     )
     next_chapter = build_info["next_chapter"]
     system_prompt = build_info["system_prompt"]
@@ -393,7 +468,19 @@ async def continue_novel(
     if temperature is not None:
         llm_kwargs["temperature"] = temperature
     for i in range(num_versions):
-        logger.info(f"Generating continuation {i+1}/{num_versions} for novel {novel_id}")
+        logger.info(
+            "Generating continuation %s/%s for novel %s",
+            i + 1,
+            num_versions,
+            novel_id,
+            extra=_continue_log_extra(
+                request_id=request_id,
+                novel_id=novel_id,
+                user_id=user_id,
+                variant=i,
+                attempt=attempt,
+            ),
+        )
 
         content = await ai_client.generate(
             prompt=generation_prompt,
@@ -439,6 +526,7 @@ async def continue_novel_stream(
     request_id: str | None = None,
     temperature: float | None = None,
     user_id: int | None = None,
+    attempt: int = 1,
 ) -> AsyncGenerator[dict, None]:
     """Yield NDJSON events for streaming continuation generation."""
     generation_prompt, effective_max_tokens, build_info = await _build_continuation_prompt(
@@ -453,6 +541,9 @@ async def continue_novel_stream(
         world_context=world_context,
         narrative_constraints=narrative_constraints,
         world_debug_summary=world_debug_summary,
+        request_id=request_id,
+        user_id=user_id,
+        attempt=attempt,
     )
     next_chapter = build_info["next_chapter"]
     system_prompt = build_info["system_prompt"]
@@ -478,6 +569,16 @@ async def continue_novel_stream(
     # Stream variant 0
     full_content = ""
     continuation_ids: list[int] = []
+    logger.info(
+        "continue_novel_stream: start streaming variant 0",
+        extra=_continue_log_extra(
+            request_id=request_id,
+            novel_id=novel_id,
+            user_id=user_id,
+            variant=0,
+            attempt=attempt,
+        ),
+    )
     try:
         async for chunk in ai_client.generate_stream(
             prompt=generation_prompt,
@@ -490,9 +591,14 @@ async def continue_novel_stream(
             yield {"type": "token", "variant": 0, "content": chunk}
     except Exception:
         logger.exception(
-            "continue_novel_stream: variant 0 streaming failed (request_id=%s, novel_id=%s)",
-            request_id,
-            novel_id,
+            "continue_novel_stream: variant 0 streaming failed",
+            extra=_continue_log_extra(
+                request_id=request_id,
+                novel_id=novel_id,
+                user_id=user_id,
+                variant=0,
+                attempt=attempt,
+            ),
         )
         yield _error_event(code="llm_stream_failed", message="续写生成失败，请重试", variant=0)
     else:
@@ -517,9 +623,14 @@ async def continue_novel_stream(
             except Exception:
                 pass
             logger.exception(
-                "continue_novel_stream: variant 0 DB persist failed (request_id=%s, novel_id=%s)",
-                request_id,
-                novel_id,
+                "continue_novel_stream: variant 0 DB persist failed",
+                extra=_continue_log_extra(
+                    request_id=request_id,
+                    novel_id=novel_id,
+                    user_id=user_id,
+                    variant=0,
+                    attempt=attempt,
+                ),
             )
             yield _error_event(code="db_persist_failed", message="保存续写结果失败，请重试", variant=0)
         else:
@@ -550,10 +661,15 @@ async def continue_novel_stream(
                 return {"variant": variant_idx, "ok": True, "content": content}
             except Exception:
                 logger.exception(
-                    "continue_novel_stream: variant %s generate failed (request_id=%s, novel_id=%s)",
+                    "continue_novel_stream: variant %s generate failed",
                     variant_idx,
-                    request_id,
-                    novel_id,
+                    extra=_continue_log_extra(
+                        request_id=request_id,
+                        novel_id=novel_id,
+                        user_id=user_id,
+                        variant=variant_idx,
+                        attempt=attempt,
+                    ),
                 )
                 return {"variant": variant_idx, "ok": False}
 
@@ -585,10 +701,15 @@ async def continue_novel_stream(
                 except Exception:
                     pass
                 logger.exception(
-                    "continue_novel_stream: variant %s DB persist failed (request_id=%s, novel_id=%s)",
+                    "continue_novel_stream: variant %s DB persist failed",
                     variant_idx,
-                    request_id,
-                    novel_id,
+                    extra=_continue_log_extra(
+                        request_id=request_id,
+                        novel_id=novel_id,
+                        user_id=user_id,
+                        variant=variant_idx,
+                        attempt=attempt,
+                    ),
                 )
                 yield _error_event(code="db_persist_failed", message="保存续写结果失败，请重试", variant=variant_idx)
             else:

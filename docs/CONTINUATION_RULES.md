@@ -15,7 +15,10 @@
 
 - `num_versions`
   - 默认 `1`
-  - 范围：`1..2`
+  - 范围：`1..4`（受服务端 `MAX_CONTINUE_VERSIONS` 配置约束）
+- `length_mode`
+  - 可选：`preset` / `custom`
+  - 未提供时自动推断：预设档位使用 `preset`，其余字数使用 `custom`
 - `prompt`
   - 可选
   - 最大长度 `2000`
@@ -24,7 +27,9 @@
   - 范围：`100..16000`
 - `target_chars`
   - 可选
-  - 仅允许：`2000`、`3000`、`4000`
+  - 范围：`800..8000`
+  - `length_mode=preset` 时仅允许：`2000`、`3000`、`4000`
+  - `length_mode=custom` 时必须提供
 - `context_chapters`
   - 可选
   - 最小 `1`
@@ -32,6 +37,13 @@
 - `temperature`
   - 可选
   - 范围：`0.0..2.0`
+- `strict_mode`
+  - 默认 `false`
+  - `true` 时启用严格一致性校验 + 自动重试修复（见第 8 节）
+- `use_lorebook`
+  - 可选
+  - 未提供时跟随服务端 `CONTINUATION_USE_LOREBOOK_DEFAULT`
+  - 提供后按请求值覆盖（`true` 启用 / `false` 关闭）
 
 校验失败时直接返回 `400/422`，不会进入模型调用阶段。
 
@@ -64,6 +76,7 @@
 5. 续写调试摘要生成
    - 记录实际注入的 systems/entities/relationships
    - 记录 relevant entity ids 与被禁用歧义词
+   - 记录 lore 注入统计（`lore_hits`、`lore_tokens_used`）
 
 ## 4. Prompt 组装规则
 
@@ -174,6 +187,7 @@
   - `llm_stream_failed`
   - `llm_generate_failed`
   - `db_persist_failed`
+  - `postcheck_strict_failed`
 
 ## 8. Postcheck（非阻断一致性检查）
 
@@ -194,7 +208,15 @@
   - `version`
   - `evidence`
 
-该检查只告警，不阻断返回。
+默认模式下该检查只告警，不阻断返回。
+
+当 `strict_mode=true` 时：
+
+- 若命中高风险漂移（当前包含：`unknown_term_named`、`unknown_address_token`），
+  服务端会删除首轮落库结果并自动重试生成一次；
+- 若重试后仍命中高风险漂移：
+  - 非流式接口返回 `422`，`detail.code=postcheck_strict_failed`
+  - 流式接口返回流内 `error` 事件，`code=postcheck_strict_failed`
 
 ## 9. 配额与并发规则
 
@@ -212,6 +234,34 @@
 - `finalize()`：返还未产出的差额
 
 因此用户只为“实际收到的版本”付费（hosted 模式）。
+
+### 9.3 观测事件与结构化日志
+
+续写链路新增事件（写入 `user_events`）：
+
+- `continue_strict_retry`
+  - strict 模式命中高风险漂移后，二次修复重试成功时记录
+- `continue_strict_fail`
+  - strict 模式二次修复后仍失败（`postcheck_strict_failed`）时记录
+- `continue_lore_enabled`
+  - 本次请求显式或默认启用 Lorebook 注入时记录
+
+事件 `meta` 统一携带：
+
+- `request_id`
+- `stream`
+- `strict_mode`
+- `use_lorebook`
+- `variant`
+- `attempt`
+
+关键生成日志统一输出以下字段（`extra`）：
+
+- `request_id`
+- `novel_id`
+- `user_id`
+- `variant`
+- `attempt`
 
 ## 10. 错误语义总结
 
@@ -245,4 +295,3 @@
 - 配额生命周期：`app/core/auth.py` (`QuotaScope`)
 - 请求模型：`app/schemas.py` (`ContinueRequest`)
 - 提示词规则：`app/utils/prompts.py`
-

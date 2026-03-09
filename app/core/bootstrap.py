@@ -835,10 +835,17 @@ async def run_bootstrap_job(
 ) -> None:
     make_session = session_factory or SessionLocal
     db = make_session()
+    reservation_id: int | None = None
+    reservation_settled = False
     try:
         job = db.query(BootstrapJob).filter(BootstrapJob.id == job_id).first()
         if not job:
             return
+        if job.quota_reservation_id is not None:
+            try:
+                reservation_id = int(job.quota_reservation_id)
+            except Exception:
+                reservation_id = None
 
         mode = resolve_bootstrap_mode(job.mode)
         draft_policy = (
@@ -947,6 +954,30 @@ async def run_bootstrap_job(
         )
         db.commit()
 
+        if reservation_id is not None:
+            from app.core.auth import charge_quota_reservation, finalize_quota_reservation
+
+            try:
+                charge_quota_reservation(db, reservation_id, count=1)
+            except Exception:
+                logger.warning(
+                    "bootstrap[%d]: failed to charge quota reservation %s",
+                    job_id,
+                    reservation_id,
+                    exc_info=True,
+                )
+            finally:
+                try:
+                    finalize_quota_reservation(db, reservation_id)
+                    reservation_settled = True
+                except Exception:
+                    logger.warning(
+                        "bootstrap[%d]: failed to finalize quota reservation %s",
+                        job_id,
+                        reservation_id,
+                        exc_info=True,
+                    )
+
         # Record analytics event after successful bootstrap
         from app.core.events import record_event
         if user_id is not None:
@@ -964,6 +995,11 @@ async def run_bootstrap_job(
             if failed_job and failed_job.status != "failed":
                 transition_bootstrap_job(failed_job, "failed", detail="bootstrap failed", error=user_error)
                 db.commit()
+            if reservation_id is not None and not reservation_settled:
+                from app.core.auth import finalize_quota_reservation
+
+                finalize_quota_reservation(db, reservation_id)
+                reservation_settled = True
         except Exception:
             db.rollback()
     finally:

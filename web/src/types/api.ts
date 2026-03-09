@@ -38,11 +38,14 @@ export interface ChapterUpdateRequest {
 
 export interface ContinueRequest {
   num_versions?: number
+  length_mode?: 'preset' | 'custom'
   prompt?: string
   max_tokens?: number
   target_chars?: number
   context_chapters?: number
   temperature?: number
+  strict_mode?: boolean
+  use_lorebook?: boolean
 }
 
 export interface PostcheckWarning {
@@ -60,6 +63,8 @@ export interface ContinueDebugSummary {
   injected_relationships: string[]
   relevant_entity_ids: number[]
   ambiguous_keywords_disabled: string[]
+  lore_hits: number
+  lore_tokens_used: number
   postcheck_warnings: PostcheckWarning[]
 }
 
@@ -308,9 +313,12 @@ export interface QuotaResponse {
 
 export interface UserPreferences {
   num_versions?: number
+  length_mode?: 'preset' | 'custom'
   temperature?: number
   context_chapters?: number
   target_chars?: number
+  strict_mode?: boolean
+  use_lorebook?: boolean
 }
 
 export type StreamEvent =

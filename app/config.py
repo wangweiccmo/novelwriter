@@ -8,6 +8,9 @@ from pydantic_settings import BaseSettings
 MIN_CONTEXT_CHAPTERS = 1
 MAX_CONTEXT_CHAPTERS = 5
 DEFAULT_CONTEXT_CHAPTERS = 5
+MIN_CONTINUATION_TARGET_CHARS = 800
+MAX_CONTINUATION_TARGET_CHARS = 8000
+MAX_CONTINUATION_VERSIONS = 4
 
 
 def clamp_context_chapters(value: int) -> int:
@@ -35,10 +38,15 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_model: str = "gpt-4o-mini"
+    llm_request_timeout_seconds: float = 60.0
+    llm_retry_attempts: int = 2
+    llm_retry_base_ms: int = 300
 
     db_auto_create: bool = False
 
     max_context_chapters: int = DEFAULT_CONTEXT_CHAPTERS
+    max_continue_versions: int = MAX_CONTINUATION_VERSIONS
+    continuation_use_lorebook_default: bool = False
     outline_chunk_size: int = 100
     default_continuation_tokens: int = 4000
     max_continuation_tokens: int = 16000
